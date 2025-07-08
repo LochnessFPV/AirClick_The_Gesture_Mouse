@@ -160,9 +160,9 @@ class HandRecog:
             dist2 = self.get_signed_dist(point[1:])
             
             try:
-                ratio = round(dist/dist2,1)
+                ratio = round(dist/dist2, 1)
             except:
-                ratio = round(dist1/0.01,1)
+                ratio = round(dist/0.01, 1)
 
             self.finger = self.finger << 1
             if ratio > 0.5 :
