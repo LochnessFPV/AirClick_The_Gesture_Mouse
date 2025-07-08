@@ -106,7 +106,7 @@ class ROI:
         self.hsv_corners = None
         
         self.marker_top = None
-        self.glove_hsv = None
+        self.hsv_glove = None
         
     def findROI(self, frame, marker):
         rec_coor = marker.corners[0][0]
