@@ -482,12 +482,12 @@ class GestureController:
     Attributes
     ----------
     gc_mode : int
-        indicates weather gesture controller is running or not,
+        indicates whether gesture controller is running or not,
         1 if running, otherwise 0.
     cap : Object
         object obtained from cv2, for capturing video frame.
     CAM_HEIGHT : int
-        highet in pixels of obtained frame from camera.
+        height in pixels of obtained frame from camera.
     CAM_WIDTH : int
         width in pixels of obtained frame from camera.
     hr_major : Object of 'HandRecog'
@@ -495,7 +495,7 @@ class GestureController:
     hr_minor : Object of 'HandRecog'
         object representing minor hand.
     dom_hand : bool
-        True if right hand is domaniant hand, otherwise False.
+        True if right hand is dominant hand, otherwise False.
         default True.
     """
     gc_mode = 0
@@ -507,7 +507,7 @@ class GestureController:
     dom_hand = True
 
     def __init__(self):
-        """Initilaizes attributes."""
+        """Initializes attributes."""
         GestureController.gc_mode = 1
         GestureController.cap = cv2.VideoCapture(0)
         GestureController.CAM_HEIGHT = GestureController.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -547,7 +547,7 @@ class GestureController:
 
     def start(self):
         """
-        Entry point of whole programm, caputres video frame and passes, obtains
+        Entry point of whole program, captures video frame and passes, obtains
         landmark from mediapipe and passes it to 'handmajor' and 'handminor' for
         controlling.
         """
