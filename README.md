@@ -189,7 +189,7 @@ Note: Use Python version: 3.8.5
   <ul>
     <li>
       <code> Proton Exit </code> <br>
-      Terminates the voice assisstant thread. GUI window needs to be closed manually.
+      Terminates the voice assistant thread. GUI window needs to be closed manually.
     </li>
   </ul>
 </details>
