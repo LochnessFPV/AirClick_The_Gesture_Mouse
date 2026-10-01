@@ -21,7 +21,8 @@ def test_numbers_are_clamped_to_their_range(settings):
 
 
 def test_values_are_coerced_to_the_declared_type(settings):
-    assert settings.set("camera", "width", "1280") == 1280
+    assert settings.set("camera", "fps_cap", "24") == 24
+    assert settings.set("camera", "resolution", "1280x720") == "1280x720"
     assert settings.set("clicks", "enable_drag", "false") is False
     assert settings.set("clicks", "enable_drag", "yes") is True
 

@@ -8,8 +8,10 @@ from Gesture_Controller import (
     GestureController,
     HandRecog,
     HLabel,
+    OneEuroFilter,
     _gesture_label,
     encode_preview,
+    parse_resolution,
 )
 
 
@@ -36,6 +38,31 @@ def configured(settings):
     Controller.reset()
     yield settings
     Controller.reset()
+
+
+@pytest.fixture
+def steady_clock(monkeypatch):
+    """Advance time by one frame per call.
+
+    The pointer filter is time-based, so back-to-back calls in a test would
+    otherwise be microseconds apart and barely move at all.
+    """
+    state = {"now": 1000.0}
+
+    def perf_counter():
+        state["now"] += 1 / 30.0
+        return state["now"]
+
+    monkeypatch.setattr("Gesture_Controller.time.perf_counter", perf_counter)
+    return state
+
+
+def settle(hand, times=25):
+    """Run the filter until it has converged on a stationary hand."""
+    position = None
+    for _ in range(times):
+        position = Controller.get_position(hand)
+    return position
 
 
 # --------------------------------------------------------------- HandRecog
@@ -77,9 +104,9 @@ def test_gesture_label_handles_unmapped_values():
 # -------------------------------------------------------------- Controller
 
 
-def test_small_movements_inside_the_dead_zone_are_ignored(configured, fake_mouse):
+def test_small_movements_inside_the_dead_zone_are_ignored(configured, steady_clock, fake_mouse):
+    configured.set("pointer", "mode", "relative")
     configured.set("pointer", "deadzone", 30)
-    configured.set("pointer", "smoothness", 1)
     Controller.configure(configured.snapshot())
 
     Controller.get_position(hand_at(0.50, 0.50))
@@ -88,39 +115,77 @@ def test_small_movements_inside_the_dead_zone_are_ignored(configured, fake_mouse
     assert moved == start
 
 
-def test_larger_movements_move_the_cursor(configured, fake_mouse):
+def test_relative_mode_pushes_the_cursor_in_the_direction_of_travel(
+    configured, steady_clock, fake_mouse
+):
+    configured.set("pointer", "mode", "relative")
     configured.set("pointer", "deadzone", 0)
     configured.set("pointer", "smoothness", 1)
     Controller.configure(configured.snapshot())
 
-    Controller.get_position(hand_at(0.3, 0.3))
+    settle(hand_at(0.3, 0.3))
     start = fake_mouse.position()
-    moved = Controller.get_position(hand_at(0.6, 0.6))
+    moved = Controller.get_position(hand_at(0.9, 0.9))
     assert moved[0] > start[0] and moved[1] > start[1]
 
 
-def test_higher_speed_moves_the_cursor_further(configured):
+def test_absolute_mode_puts_the_cursor_where_the_hand_is(
+    configured, steady_clock, fake_mouse
+):
+    configured.set("pointer", "mode", "absolute")
+    configured.set("pointer", "deadzone", 0)
+    configured.set("pointer", "smoothness", 1)
+    Controller.configure(configured.snapshot())
+
+    width, height = fake_mouse.size()
+    centre = settle(hand_at(0.5, 0.5))
+    assert abs(centre[0] - width / 2) < width * 0.05
+    assert abs(centre[1] - height / 2) < height * 0.05
+
+    Controller.reset_tracking()
+    left = settle(hand_at(0.3, 0.5))
+    Controller.reset_tracking()
+    right = settle(hand_at(0.7, 0.5))
+    assert right[0] > left[0]
+
+
+def test_absolute_mode_can_reach_the_screen_edges(configured, steady_clock, fake_mouse):
+    """The hand must not have to leave the camera's view to reach an edge."""
+    configured.set("pointer", "mode", "absolute")
+    configured.set("pointer", "deadzone", 0)
+    configured.set("pointer", "smoothness", 1)
+    Controller.configure(configured.snapshot())
+
+    width, height = fake_mouse.size()
+    Controller.reset_tracking()
+    assert settle(hand_at(0.1, 0.1)) == (1, 1)
+    Controller.reset_tracking()
+    assert settle(hand_at(0.9, 0.9)) == (width - 2, height - 2)
+
+
+def test_higher_speed_needs_less_hand_travel(configured, steady_clock):
+    configured.set("pointer", "mode", "absolute")
     configured.set("pointer", "deadzone", 0)
     configured.set("pointer", "smoothness", 1)
 
     def travel(speed):
         configured.set("pointer", "speed", speed)
         Controller.configure(configured.snapshot())
-        Controller.reset()
-        Controller.get_position(hand_at(0.4, 0.5))
-        before = Controller.get_position(hand_at(0.4, 0.5))
-        after = Controller.get_position(hand_at(0.6, 0.5))
-        return after[0] - before[0]
+        Controller.reset_tracking()
+        left = settle(hand_at(0.45, 0.5))
+        Controller.reset_tracking()
+        right = settle(hand_at(0.55, 0.5))
+        return right[0] - left[0]
 
     assert travel(2.0) > travel(0.5)
 
 
-def test_the_cursor_never_reaches_a_failsafe_corner(configured, fake_mouse):
+def test_the_cursor_never_reaches_a_failsafe_corner(configured, steady_clock, fake_mouse):
     configured.set("pointer", "deadzone", 0)
     configured.set("pointer", "speed", 3.0)
     Controller.configure(configured.snapshot())
 
-    Controller.get_position(hand_at(0.9, 0.9))
+    settle(hand_at(0.9, 0.9))
     for _ in range(40):
         x, y = Controller.get_position(hand_at(0.0, 0.0))
         fake_mouse.CURSOR[:] = [x, y]
@@ -167,7 +232,7 @@ def test_scroll_step_follows_the_setting(configured, fake_mouse):
     assert ("scroll", (240,), {}) in fake_mouse.calls
 
 
-# ----------------------------------------------------------------- preview
+# ------------------------------------------------------------ hand routing
 
 
 def test_preview_frames_are_shrunk_and_jpeg_encoded():
@@ -190,6 +255,56 @@ def test_preview_frames_are_shrunk_and_jpeg_encoded():
 def test_the_preview_setting_offers_all_three_destinations(settings):
     for choice in ("in app window", "separate window", "off"):
         assert settings.set("camera", "preview", choice) == choice
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [("640x480", (640, 480)), ("1920x1080", (1920, 1080)), ("nonsense", (640, 480))],
+)
+def test_resolution_parsing(text, expected):
+    assert parse_resolution(text) == expected
+
+
+# --------------------------------------------------------- pointer filter
+
+
+def noisy_run(filter_, value, jitter, frames=60):
+    """Feed a stationary value with alternating noise and report the spread."""
+    outputs = []
+    for frame in range(frames):
+        sample = value + (jitter if frame % 2 else -jitter)
+        outputs.append(filter_(sample, 1000.0 + frame / 30.0))
+    tail = outputs[len(outputs) // 2:]
+    return max(tail) - min(tail)
+
+
+def test_the_filter_removes_jitter_from_a_still_hand():
+    calm = OneEuroFilter(min_cutoff=0.3)
+    assert noisy_run(calm, 500.0, jitter=10.0) < 4.0
+
+
+def test_more_smoothing_removes_more_jitter():
+    snappy = noisy_run(OneEuroFilter(min_cutoff=4.0), 500.0, jitter=10.0)
+    calm = noisy_run(OneEuroFilter(min_cutoff=0.3), 500.0, jitter=10.0)
+    assert calm < snappy
+
+
+def test_the_filter_keeps_up_with_deliberate_movement():
+    """The whole point: fast movement must not be damped like jitter is."""
+    filter_ = OneEuroFilter(min_cutoff=0.3, beta=0.01)
+    output = 0.0
+    for frame in range(30):
+        output = filter_(frame * 60.0, 1000.0 + frame / 30.0)
+    target = 29 * 60.0
+    assert output > target * 0.8  # tracking, not lagging far behind
+
+
+def test_the_filter_starts_at_the_first_sample_and_resets():
+    filter_ = OneEuroFilter()
+    assert filter_(123.0, 1.0) == 123.0
+    filter_(456.0, 1.1)
+    filter_.reset()
+    assert filter_(789.0, 2.0) == 789.0
 
 
 # ------------------------------------------------------------ hand routing

@@ -249,13 +249,24 @@ Every setting - pointer speed, smoothing, click behaviour, camera, safety - can 
 
   | Group | What you can change |
   | ----- | ------------------- |
-  | Pointer | Speed, smoothness, dead zone, glide time |
+  | Pointer | Mode (absolute or relative), speed, smoothness, dead zone |
   | Clicks | Pinch sensitivity and hold time, gesture stability, and a switch for each click type |
   | Scroll & Media | Scroll speed, volume step, brightness step, and a switch for each |
   | Camera | Device, resolution, frame-rate limit, preview (in the app window, a separate window, or off), mirroring |
-  | Modes | Glove mode, dominant hand, detection and tracking confidence, voice assistant |
+  | Modes | Glove mode, dominant hand, tracking quality, hands to track, detection and tracking confidence, voice assistant |
   | Safety | Corner failsafe, panic hotkey, auto-pause when no hand is seen |
   | General | Log detail, confirmation before opening files |
+
+  **Pointer mode** is worth knowing about. *Absolute* maps an area of the camera
+  view straight onto the screen, like a graphics tablet, so the cursor always
+  corresponds to where your hand is. *Relative* nudges the cursor along from
+  wherever it already is, like a mouse, which lets you reposition your hand but
+  gradually drifts out of correspondence.
+
+  If the cursor feels slow, lower the **resolution** and set **tracking
+  quality** to *fast*: hand tracking is the expensive part, and it shrinks the
+  image internally anyway, so a larger capture costs time without helping
+  accuracy. If the cursor shakes, raise **smoothness** or the **dead zone**.
 
   Settings are stored in `~/.airclick/settings.json` (set the `AIRCLICK_SETTINGS`
   environment variable to use a different location), together with a rotating

@@ -19,7 +19,12 @@ import cv2
 import cv2.aruco as aruco
 import pyautogui
 
-from Gesture_Controller import CameraError, encode_preview, open_camera
+from Gesture_Controller import (
+    CameraError,
+    encode_preview,
+    open_camera,
+    parse_resolution,
+)
 from airclick_settings import get_settings
 
 LOGGER = logging.getLogger("airclick.glove")
@@ -531,7 +536,6 @@ class Mouse:
         clicks = config["clicks"]
         speed = float(pointer["speed"])
         deadzone = float(pointer["deadzone"])
-        glide = float(pointer["glide"])
 
         (sx,sy)=pyautogui.size()
         (camx,camy) = (frame.shape[:2][0],frame.shape[:2][1])
@@ -554,7 +558,7 @@ class Mouse:
             my = my_old + (delta_ty * sy * speed) / (camy * 2)
             mx = max(1, min(sx - 2, mx))
             my = max(1, min(sy - 2, my))
-            pyautogui.moveTo(int(mx), int(my), duration = glide)
+            pyautogui.moveTo(int(mx), int(my), duration = 0)
 
         elif(gesture == 0):
             if self.flag == 0:
@@ -670,9 +674,7 @@ class GestureController:
 
                 wanted_camera = (
                     int(camera["device_index"]),
-                    int(camera["width"]),
-                    int(camera["height"]),
-                )
+                ) + parse_resolution(camera["resolution"])
                 if wanted_camera != camera_config:
                     if capture is not None:
                         capture.release()
@@ -681,7 +683,12 @@ class GestureController:
                     GestureController.cap = capture
                     GestureController.cam_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
                     GestureController.cam_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    LOGGER.info("Using camera %s at %sx%s", *wanted_camera)
+                    LOGGER.info(
+                        "Camera %s delivering %sx%s",
+                        wanted_camera[0],
+                        GestureController.cam_width,
+                        GestureController.cam_height,
+                    )
 
                 ret, frame = capture.read()
                 if not ret or frame is None:

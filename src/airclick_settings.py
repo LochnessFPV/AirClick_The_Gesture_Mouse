@@ -66,6 +66,12 @@ SECTION_LABELS: Dict[str, str] = {
 
 SCHEMA: Dict[str, Dict[str, Setting]] = {
     "pointer": {
+        "mode": Setting(
+            "absolute", "choice", "Pointer mode",
+            "Absolute maps your hand straight onto the screen, like a graphics "
+            "tablet. Relative nudges the cursor along, like a mouse.",
+            choices=("absolute", "relative"),
+        ),
         "speed": Setting(
             1.0, "float", "Pointer speed",
             "How far the cursor travels for a given hand movement.",
@@ -80,11 +86,6 @@ SCHEMA: Dict[str, Dict[str, Setting]] = {
             6, "int", "Dead zone (pixels)",
             "Hand tremors smaller than this are ignored completely.",
             minimum=0, maximum=40, step=1,
-        ),
-        "glide": Setting(
-            0.05, "float", "Glide time (seconds)",
-            "Time the cursor takes to glide to its new position. 0 is instant.",
-            minimum=0.0, maximum=0.3, step=0.01,
         ),
     },
     "clicks": {
@@ -132,11 +133,11 @@ SCHEMA: Dict[str, Dict[str, Setting]] = {
             "Which webcam to use. 0 is the built-in camera on most laptops.",
             minimum=0, maximum=10, step=1,
         ),
-        "width": Setting(
-            640, "choice", "Capture width", choices=(320, 640, 800, 1280, 1920),
-        ),
-        "height": Setting(
-            480, "choice", "Capture height", choices=(240, 480, 600, 720, 1080),
+        "resolution": Setting(
+            "640x480", "choice", "Capture resolution",
+            "Bigger is slower and no more accurate: hand tracking shrinks the "
+            "image anyway.",
+            choices=("320x240", "640x480", "800x600", "1280x720", "1920x1080"),
         ),
         "fps_cap": Setting(
             30, "int", "Frame rate limit",
@@ -156,7 +157,20 @@ SCHEMA: Dict[str, Dict[str, Setting]] = {
             "Track a coloured glove with a marker instead of a bare hand.",
         ),
         "dominant_hand": Setting(
-            "right", "choice", "Dominant hand", choices=("right", "left"),
+            "right", "choice", "Dominant hand",
+            "Which hand leads when both are visible. A single hand always "
+            "controls the cursor, whichever one it is.",
+            choices=("right", "left"),
+        ),
+        "tracking_quality": Setting(
+            "fast", "choice", "Tracking quality",
+            "Accurate uses a heavier model: steadier landmarks, lower frame rate.",
+            choices=("fast", "accurate"),
+        ),
+        "max_hands": Setting(
+            2, "choice", "Hands to track",
+            "One hand is faster. Two are needed for pinch scrolling.",
+            choices=(1, 2),
         ),
         "detection_confidence": Setting(
             0.5, "float", "Detection confidence",
@@ -180,7 +194,7 @@ SCHEMA: Dict[str, Dict[str, Setting]] = {
             choices=("ctrl+alt+q", "ctrl+alt+p", "ctrl+shift+q", "none"),
         ),
         "auto_pause_seconds": Setting(
-            3.0, "float", "Auto-pause after (seconds)",
+            5.0, "float", "Auto-pause after (seconds)",
             "Pause control when no hand has been seen. 0 disables auto-pause.",
             minimum=0.0, maximum=30.0, step=0.5,
         ),

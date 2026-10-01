@@ -67,6 +67,55 @@ def encode_preview(image):
     return base64.b64encode(buffer).decode("ascii")
 
 
+class OneEuroFilter:
+    """Speed-adaptive low-pass filter.
+
+    A fixed amount of smoothing cannot be both steady when the hand is still
+    and responsive when it moves: raise it and the cursor lags, lower it and it
+    shakes. This filter widens its own cutoff as the hand speeds up, so slow
+    movement is heavily damped and fast movement passes through almost
+    untouched.
+
+    Casiez, Roussel and Vogel, "1 Euro Filter", CHI 2012.
+    """
+
+    def __init__(self, min_cutoff=1.0, beta=0.01, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.reset()
+
+    def reset(self):
+        self._value = None
+        self._derivative = 0.0
+        self._timestamp = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, value, timestamp):
+        if self._value is None:
+            self._value = value
+            self._timestamp = timestamp
+            return value
+
+        dt = timestamp - self._timestamp
+        if dt <= 0.0:
+            dt = 1e-3
+        self._timestamp = timestamp
+
+        derivative = (value - self._value) / dt
+        alpha_d = self._alpha(self.d_cutoff, dt)
+        self._derivative = alpha_d * derivative + (1.0 - alpha_d) * self._derivative
+
+        cutoff = self.min_cutoff + self.beta * abs(self._derivative)
+        alpha = self._alpha(cutoff, dt)
+        self._value = alpha * value + (1.0 - alpha) * self._value
+        return self._value
+
+
 class CameraError(RuntimeError):
     """Raised when the configured webcam cannot be opened or read."""
 
@@ -330,8 +379,12 @@ class Controller:
     pinchlv = 0
     framecount = 0
     prev_hand = None
-    smoothed_hand = None
     pinch_threshold = 0.3
+
+    # Pointer smoothing, retuned whenever the Smoothness setting changes.
+    _filter_x = OneEuroFilter()
+    _filter_y = OneEuroFilter()
+    _filter_smoothness = None
 
     # Settings snapshot for the frame currently being processed.
     _config: Dict[str, Dict[str, object]] = {}
@@ -341,6 +394,23 @@ class Controller:
         """Point the controller at the settings snapshot for this frame."""
         cls._config = config
         cls.pinch_threshold = float(config["clicks"]["pinch_sensitivity"])
+
+    @classmethod
+    def reset_tracking(cls):
+        """Forget pointer history so a returning hand does not fling the cursor."""
+        cls.prev_hand = None
+        cls._filter_x.reset()
+        cls._filter_y.reset()
+
+    @classmethod
+    def _tune_filters(cls, smoothness):
+        if smoothness == cls._filter_smoothness:
+            return
+        cls._filter_smoothness = smoothness
+        # Smoothness 1 -> 4 Hz cutoff (snappy), 10 -> 0.3 Hz (very calm).
+        min_cutoff = 4.0 * (0.075 ** ((smoothness - 1) / 9.0))
+        cls._filter_x.min_cutoff = min_cutoff
+        cls._filter_y.min_cutoff = min_cutoff
 
     @classmethod
     def reset(cls):
@@ -354,11 +424,10 @@ class Controller:
         cls.grabflag = False
         cls.pinchmajorflag = False
         cls.pinchminorflag = False
-        cls.prev_hand = None
-        cls.smoothed_hand = None
         cls.framecount = 0
         cls.pinchlv = 0
         cls.prevpinchlv = 0
+        cls.reset_tracking()
 
     def getpinchylv(hand_result):
         """returns distance beween starting pinch y coord and current hand position y coord."""
@@ -407,14 +476,16 @@ class Controller:
             pyautogui.keyUp('shift')
 
     # Locate Hand to get Cursor Position
-    # Stabilize cursor by smoothing, a dead zone and an acceleration curve
+    # Stabilize cursor by speed-adaptive filtering and a dead zone
     def get_position(hand_result):
         """
         returns coordinates of current hand position.
 
-        The raw landmark is low-pass filtered (the "Smoothness" setting), then
-        movements smaller than the dead zone are discarded, and what remains is
-        scaled by the acceleration curve and the pointer speed.
+        In 'absolute' mode an area of the camera frame maps straight onto the
+        screen, like a graphics tablet, so the cursor always corresponds to
+        where the hand is. In 'relative' mode the hand nudges the cursor from
+        wherever it happens to be, like a mouse, which allows repositioning but
+        slowly drifts out of correspondence.
 
         Returns
         -------
@@ -423,46 +494,54 @@ class Controller:
         pointer = Controller._config.get("pointer", {})
         smoothness = int(pointer.get("smoothness", 5))
         deadzone = float(pointer.get("deadzone", 6))
-        speed = float(pointer.get("speed", 1.0))
+        speed = max(0.2, float(pointer.get("speed", 1.0)))
+        absolute = pointer.get("mode", "absolute") == "absolute"
+
+        Controller._tune_filters(smoothness)
 
         screen_w, screen_h = pyautogui.size()
-        raw_x = hand_result.landmark[9].x * screen_w
-        raw_y = hand_result.landmark[9].y * screen_h
-
-        # smoothness 1 (snappy) -> alpha ~0.96, smoothness 10 (calm) -> ~0.10
-        alpha = max(0.08, min(1.0, 1.05 - smoothness * 0.095))
-        if Controller.smoothed_hand is None:
-            Controller.smoothed_hand = (raw_x, raw_y)
-        else:
-            prev_sx, prev_sy = Controller.smoothed_hand
-            Controller.smoothed_hand = (
-                prev_sx + alpha * (raw_x - prev_sx),
-                prev_sy + alpha * (raw_y - prev_sy),
-            )
-
-        x, y = Controller.smoothed_hand
-        if Controller.prev_hand is None:
-            Controller.prev_hand = (x, y)
-
-        delta_x = x - Controller.prev_hand[0]
-        delta_y = y - Controller.prev_hand[1]
-        Controller.prev_hand = (x, y)
-
-        distance = math.hypot(delta_x, delta_y)
-        if distance <= deadzone:
-            ratio = 0.0
-        else:
-            ratio = min(_ACCEL_CEILING, _ACCEL_GAIN * distance) * speed
-
         cursor_x, cursor_y = pyautogui.position()
-        target_x = cursor_x + delta_x * ratio
-        target_y = cursor_y + delta_y * ratio
+        now = time.perf_counter()
+
+        if absolute:
+            # Only the middle of the frame is used, so the hand never has to
+            # reach the edge of the camera's view to reach the edge of the
+            # screen. A higher speed shrinks the area, needing less hand travel.
+            active = max(0.25, min(1.0, 0.7 / speed))
+            margin = (1.0 - active) / 2.0
+            normal_x = (hand_result.landmark[9].x - margin) / active
+            normal_y = (hand_result.landmark[9].y - margin) / active
+            x = Controller._filter_x(
+                min(1.0, max(0.0, normal_x)) * screen_w, now
+            )
+            y = Controller._filter_y(
+                min(1.0, max(0.0, normal_y)) * screen_h, now
+            )
+            if math.hypot(x - cursor_x, y - cursor_y) <= deadzone:
+                x, y = cursor_x, cursor_y
+        else:
+            filtered_x = Controller._filter_x(hand_result.landmark[9].x * screen_w, now)
+            filtered_y = Controller._filter_y(hand_result.landmark[9].y * screen_h, now)
+            if Controller.prev_hand is None:
+                Controller.prev_hand = (filtered_x, filtered_y)
+
+            delta_x = filtered_x - Controller.prev_hand[0]
+            delta_y = filtered_y - Controller.prev_hand[1]
+            Controller.prev_hand = (filtered_x, filtered_y)
+
+            distance = math.hypot(delta_x, delta_y)
+            if distance <= deadzone:
+                ratio = 0.0
+            else:
+                ratio = min(_ACCEL_CEILING, _ACCEL_GAIN * distance) * speed
+            x = cursor_x + delta_x * ratio
+            y = cursor_y + delta_y * ratio
 
         # Stay a pixel clear of the screen corners so gesture movement never
         # trips the corner failsafe, which is reserved for the physical mouse.
-        target_x = max(1, min(screen_w - 2, target_x))
-        target_y = max(1, min(screen_h - 2, target_y))
-        return (int(target_x), int(target_y))
+        x = max(1, min(screen_w - 2, x))
+        y = max(1, min(screen_h - 2, y))
+        return (int(x), int(y))
 
     def pinch_control_init(hand_result):
         """Initializes attributes for pinch gesture."""
@@ -526,7 +605,6 @@ class Controller:
             return
 
         clicks = Controller._config.get("clicks", {})
-        glide = float(Controller._config.get("pointer", {}).get("glide", 0.05))
 
         x,y = None,None
         if gesture != Gest.PALM :
@@ -546,16 +624,16 @@ class Controller:
         # implementation
         if gesture == Gest.V_GEST:
             Controller.flag = True
-            pyautogui.moveTo(x, y, duration = glide)
+            pyautogui.moveTo(x, y, duration = 0)
 
         elif gesture == Gest.FIST:
             if not clicks.get("enable_drag", True):
-                pyautogui.moveTo(x, y, duration = glide)
+                pyautogui.moveTo(x, y, duration = 0)
                 return
             if not Controller.grabflag : 
                 Controller.grabflag = True
                 pyautogui.mouseDown(button = "left")
-            pyautogui.moveTo(x, y, duration = glide)
+            pyautogui.moveTo(x, y, duration = 0)
 
         elif gesture == Gest.MID and Controller.flag:
             if clicks.get("enable_left_click", True):
@@ -584,6 +662,16 @@ class Controller:
                 Controller.pinchmajorflag = True
             Controller.pinch_control(hand_result,Controller.changesystembrightness, Controller.changesystemvolume)
         
+def parse_resolution(value):
+    """Turn a '640x480' setting into a (width, height) pair."""
+    try:
+        width, height = str(value).lower().split("x")
+        return int(width), int(height)
+    except (AttributeError, TypeError, ValueError):
+        LOGGER.warning("Unreadable resolution %r, falling back to 640x480", value)
+        return 640, 480
+
+
 def open_camera(index, width, height):
     """Open a webcam, preferring the fast DirectShow back end on Windows."""
     backends = [cv2.CAP_DSHOW, cv2.CAP_ANY] if system.IS_WINDOWS else [cv2.CAP_ANY]
@@ -828,11 +916,8 @@ class GestureController:
                 self._apply_runtime_settings(config)
 
                 camera = config["camera"]
-                wanted_camera = (
-                    int(camera["device_index"]),
-                    int(camera["width"]),
-                    int(camera["height"]),
-                )
+                width, height = parse_resolution(camera["resolution"])
+                wanted_camera = (int(camera["device_index"]), width, height)
                 if wanted_camera != camera_config:
                     if capture is not None:
                         capture.release()
@@ -841,18 +926,28 @@ class GestureController:
                     GestureController.cap = capture
                     GestureController.CAM_WIDTH = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
                     GestureController.CAM_HEIGHT = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                    LOGGER.info("Using camera %s at %sx%s", *wanted_camera)
+                    LOGGER.info(
+                        "Camera %s delivering %gx%g (asked for %sx%s)",
+                        wanted_camera[0],
+                        GestureController.CAM_WIDTH,
+                        GestureController.CAM_HEIGHT,
+                        width,
+                        height,
+                    )
 
                 modes = config["modes"]
                 wanted_hands = (
                     float(modes["detection_confidence"]),
                     float(modes["tracking_confidence"]),
+                    1 if modes["tracking_quality"] == "accurate" else 0,
+                    int(modes["max_hands"]),
                 )
                 if wanted_hands != hands_config:
                     if hands is not None:
                         hands.close()
                     hands = mp_hands.Hands(
-                        max_num_hands=2,
+                        max_num_hands=wanted_hands[3],
+                        model_complexity=wanted_hands[2],
                         min_detection_confidence=wanted_hands[0],
                         min_tracking_confidence=wanted_hands[1],
                     )
@@ -915,8 +1010,7 @@ class GestureController:
                                 image, hand_landmarks, mp_hands.HAND_CONNECTIONS
                             )
                 else:
-                    Controller.prev_hand = None
-                    Controller.smoothed_hand = None
+                    Controller.reset_tracking()
                     auto_pause = float(config["safety"]["auto_pause_seconds"])
                     if (
                         auto_pause > 0
