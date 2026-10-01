@@ -1,58 +1,127 @@
+"""Glove tracking gesture engine.
+
+An alternative to the bare-hand engine: an ArUco marker on the wrist locates a
+coloured glove, and the glove's silhouette is turned into finger counts.
+
+Shares the settings store, logging and lifecycle contract of
+:mod:`Gesture_Controller`, so the two engines are interchangeable.
+"""
+
+import logging
+import math
+import os
+import glob
+import threading
+import time
+
 import numpy as np
 import cv2
 import cv2.aruco as aruco
-import os
-import glob
-import math
 import pyautogui
-import time
+
+from Gesture_Controller import CameraError, open_camera
+from airclick_settings import get_settings
+
+LOGGER = logging.getLogger("airclick.glove")
+
+pyautogui.PAUSE = 0
+
+# Camera intrinsics used when no checkerboard calibration images are present.
+_FALLBACK_MTX = np.array(
+    [[534.34144579, 0.0, 339.15527836],
+     [0.0, 534.68425882, 233.84359493],
+     [0.0, 0.0, 1.0]]
+)
+_FALLBACK_DIST = np.array(
+    [[-2.88320983e-01, 5.41079685e-02, 1.73501622e-03, -2.61333895e-04, 2.04110465e-01]]
+)
+
+
+def _build_aruco(dict_type, thresh_constant):
+    """Create an ArUco dictionary and detector parameters.
+
+    OpenCV 4.7 renamed ``Dictionary_get``/``DetectorParameters_create`` to
+    ``getPredefinedDictionary``/``DetectorParameters``; support both so the app
+    works on old and current OpenCV releases.
+    """
+    if hasattr(aruco, "getPredefinedDictionary"):
+        aruco_dict = aruco.getPredefinedDictionary(dict_type)
+    else:  # OpenCV < 4.7
+        aruco_dict = aruco.Dictionary_get(dict_type)
+
+    if hasattr(aruco, "DetectorParameters"):
+        parameters = aruco.DetectorParameters()
+    else:  # OpenCV < 4.7
+        parameters = aruco.DetectorParameters_create()
+    parameters.adaptiveThreshConstant = thresh_constant
+    return aruco_dict, parameters
+
+
+def _detect_markers(gray_frame, aruco_dict, parameters):
+    """Detect markers through whichever API this OpenCV build provides."""
+    if hasattr(aruco, "ArucoDetector"):
+        detector = aruco.ArucoDetector(aruco_dict, parameters)
+        return detector.detectMarkers(gray_frame)
+    return aruco.detectMarkers(gray_frame, aruco_dict, parameters=parameters)
+
 
 class Marker:
     def __init__(self, dict_type = aruco.DICT_4X4_50, thresh_constant = 1):
-        self.aruco_dict = aruco.Dictionary_get(dict_type)
-        self.parameters = aruco.DetectorParameters_create()
-        self.parameters.adaptiveThreshConstant = thresh_constant
+        self.aruco_dict, self.parameters = _build_aruco(dict_type, thresh_constant)
         self.corners = None # corners of Marker
         self.marker_x2y = 1 # width:height ratio
         self.mtx, self.dist = Marker.calibrate()
     
     def calibrate():
+        """Estimate camera intrinsics from the bundled checkerboard images.
+
+        Falls back to known-good defaults when the images are missing or no
+        board can be found, instead of raising at import time.
+        """
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
         objp = np.zeros((6*7,3), np.float32)
         objp[:,:2] = np.mgrid[0:7,0:6].T.reshape(-1,2)
         objpoints = [] # 3d point in real world space
         imgpoints = [] # 2d points in image plane.
         path = os.path.dirname(os.path.abspath(__file__))
-        p1 = path + r'\calib_images\checkerboard\*.jpg'
+        p1 = os.path.join(path, 'calib_images', 'checkerboard', '*.jpg')
         images = glob.glob(p1)
+        gray = None
         for fname in images:
             img = cv2.imread(fname)
+            if img is None:
+                LOGGER.warning("Skipping unreadable calibration image %s", fname)
+                continue
             gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
             ret, corners = cv2.findChessboardCorners(gray, (7,6),None)
             if ret == True:
                 objpoints.append(objp)
                 corners2 = cv2.cornerSubPix(gray,corners,(11,11),(-1,-1),criteria)
                 imgpoints.append(corners2)
-                img = cv2.drawChessboardCorners(img, (7,6), corners2,ret)
-                
-        ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1],None,None)
-        
-        #mtx = [[534.34144579,0.0,339.15527836],[0.0,534.68425882,233.84359493],[0.0,0.0,1.0]]
-        #dist = [[-2.88320983e-01, 5.41079685e-02, 1.73501622e-03, -2.61333895e-04, 2.04110465e-01]]
+
+        if not objpoints or gray is None:
+            LOGGER.warning(
+                "No usable calibration images in %s; using default camera intrinsics", p1
+            )
+            return _FALLBACK_MTX, _FALLBACK_DIST
+
+        try:
+            _, mtx, dist, _, _ = cv2.calibrateCamera(
+                objpoints, imgpoints, gray.shape[::-1], None, None
+            )
+        except cv2.error:
+            LOGGER.warning("Camera calibration failed; using defaults", exc_info=True)
+            return _FALLBACK_MTX, _FALLBACK_DIST
         return mtx, dist
     
     def detect(self, frame):
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.corners, ids, rejectedImgPoints = aruco.detectMarkers(gray_frame, self.aruco_dict, parameters = self.parameters)
-        if np.all(ids != None):
-            rvec, tvec ,_ = aruco.estimatePoseSingleMarkers(self.corners, 0.05, self.mtx, self.dist)
-        else:
+        self.corners, ids, _ = _detect_markers(gray_frame, self.aruco_dict, self.parameters)
+        if ids is None or len(ids) == 0:
             self.corners = None
     
     def is_detected(self):
-        if self.corners:
-            return True
-        return False
+        return self.corners is not None and len(self.corners) > 0
     
     def draw_marker(self, frame):
         aruco.drawDetectedMarkers(frame, self.corners)
@@ -66,10 +135,10 @@ def ecu_dis(p1, p2):
 def find_HSV(samples):
     try:
         color = np.uint8([ samples ])
-    except:
+    except (TypeError, ValueError):
+        LOGGER.debug("Unusable colour sample, falling back to a default")
         color = np.uint8([ [[105,105,50]] ])
     hsv_color = cv2.cvtColor(color,cv2.COLOR_RGB2HSV)
-    #print( hsv_color )
     return hsv_color
 
 def draw_box(frame, points, color=(0,255,127)):
@@ -259,8 +328,13 @@ class Glove:
     
     def find_fingers(self, FinalMask):
         conts,h=cv2.findContours(FinalMask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
-        hull = [cv2.convexHull(c) for c in conts]
-        
+
+        approx, defects = None, None
+        if not conts:
+            LOGGER.debug("No contours found in the glove mask")
+            self.fingers = 0
+            return
+
         try:
             cnt = max(conts, key = lambda x: cv2.contourArea(x))
             #approx the contour a little
@@ -271,50 +345,57 @@ class Glove:
             #define area of hull and area of hand
             areahull = cv2.contourArea(hull)
             areacnt = cv2.contourArea(cnt)
+            if areacnt <= 0:
+                self.fingers = 0
+                return
             #find the percentage of area not covered by hand in convex hull
             self.arearatio=((areahull-areacnt)/areacnt)*100
             #find the defects in convex hull with respect to hand
             hull = cv2.convexHull(approx, returnPoints=False)
             defects = cv2.convexityDefects(approx, hull)
-        except:
-            print("No Contours found in FinalMask")
-        
+        except cv2.error:
+            LOGGER.debug("Could not analyse the glove contour", exc_info=True)
+            self.fingers = 0
+            return
+
+        if defects is None or approx is None:
+            LOGGER.debug("No convexity defects found in the glove mask")
+            self.fingers = 0
+            return
+
         # l = no. of defects
         l=0
-        try:
-            #code for finding no. of defects due to fingers
-            for i in range(defects.shape[0]):
-                s,e,f,d = defects[i,0]
-                start = tuple(approx[s][0])
-                end = tuple(approx[e][0])
-                far = tuple(approx[f][0])
-                
-                # find length of all sides of triangle
-                a = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
-                b = math.sqrt((far[0] - start[0])**2 + (far[1] - start[1])**2)
-                c = math.sqrt((end[0] - far[0])**2 + (end[1] - far[1])**2)
-                s = (a+b+c)/2
-                ar = math.sqrt(s*(s-a)*(s-b)*(s-c))
-                
-                #distance between point and convex hull
-                d=(2*ar)/a
-                
-                # apply cosine rule here
-                angle = math.acos((b**2 + c**2 - a**2)/(2*b*c)) * 57
-                      
-                # ignore angles > 90 and ignore points very close to convex hull(they generally come due to noise)
-                if angle <= 90 and d>30:
-                    l += 1
-                    #cv2.circle(frame, far, 3, [255,255,255], -1)
-                
-                #draw lines around hand
-                cv2.line(FinalMask,start, end, [255,255,255], 2)
-                
-            l+=1
-        except:
-            l = 0
-            print("No Defects found in mask")
-        
+        #code for finding no. of defects due to fingers
+        for i in range(defects.shape[0]):
+            s,e,f,d = defects[i,0]
+            start = tuple(approx[s][0])
+            end = tuple(approx[e][0])
+            far = tuple(approx[f][0])
+
+            # find length of all sides of triangle
+            a = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
+            b = math.sqrt((far[0] - start[0])**2 + (far[1] - start[1])**2)
+            c = math.sqrt((end[0] - far[0])**2 + (end[1] - far[1])**2)
+            if a <= 0 or b <= 0 or c <= 0:
+                continue
+            s = (a+b+c)/2
+            ar = math.sqrt(max(0.0, s*(s-a)*(s-b)*(s-c)))
+
+            #distance between point and convex hull
+            d=(2*ar)/a
+
+            # apply cosine rule here
+            cosine = (b**2 + c**2 - a**2)/(2*b*c)
+            angle = math.acos(max(-1.0, min(1.0, cosine))) * 57
+
+            # ignore angles > 90 and ignore points very close to convex hull(they generally come due to noise)
+            if angle <= 90 and d>30:
+                l += 1
+
+            #draw lines around hand
+            cv2.line(FinalMask,start, end, [255,255,255], 2)
+
+        l+=1
         self.fingers = l
         
     def find_gesture(self, frame):
@@ -380,20 +461,22 @@ class Tracker:
         
         if self.tracker_started == False:
             if self.tracker == None:
-                self.tracker = cv2.TrackerCSRT_create()
+                self.tracker = _create_csrt_tracker()
+                if self.tracker is None:
+                    return
         
         if self.tracker_bbox != None:
             try:
                 self.start_time = time.time()
-                ok = self.tracker.init(frame, self.tracker_bbox)
+                self.tracker.init(frame, self.tracker_bbox)
                 self.tracker_started = True
-            except:
-                print("tracker.init failed")
+            except cv2.error:
+                LOGGER.debug("Tracker could not be initialised", exc_info=True)
         try:
             ok, self.tracker_bbox = self.tracker.update(frame)
-        except:
+        except cv2.error:
             ok = None
-            print("tracker.update failed")
+            LOGGER.debug("Tracker update failed", exc_info=True)
         self.now_time = time.time()
         
         if self.now_time-self.start_time >= 2.0 :
@@ -413,11 +496,22 @@ class Tracker:
             # Tracking failure
             self.tracker_started = False
             cv2.putText(frame, "Tracking failure detected", (100,80), cv2.FONT_HERSHEY_SIMPLEX, 0.75,(0,0,255),2)
-            print("Tracking failure detected")
-            #reintiallize code to tackle tracking failure
-            
-    
-        
+            LOGGER.debug("Tracking failure detected")
+
+
+def _create_csrt_tracker():
+    """Create a CSRT tracker across the OpenCV builds that move it around."""
+    for factory in (
+        getattr(cv2, "TrackerCSRT_create", None),
+        getattr(getattr(cv2, "legacy", None), "TrackerCSRT_create", None),
+    ):
+        if factory is not None:
+            try:
+                return factory()
+            except cv2.error:
+                continue
+    LOGGER.warning("CSRT tracking is unavailable in this OpenCV build")
+    return None
         
         
 
@@ -427,118 +521,238 @@ class Mouse:
         self.ty_old = 0
         self.trial = True
         self.flag = 0
-        
-    def move_mouse(self,frame,position,gesture):
-        
+
+    def reset(self):
+        self.trial = True
+        self.flag = 0
+
+    def move_mouse(self, frame, position, gesture, config):
+        pointer = config["pointer"]
+        clicks = config["clicks"]
+        speed = float(pointer["speed"])
+        deadzone = float(pointer["deadzone"])
+        glide = float(pointer["glide"])
+
         (sx,sy)=pyautogui.size()
         (camx,camy) = (frame.shape[:2][0],frame.shape[:2][1])
         (mx_old,my_old) = pyautogui.position()
-        
-        
-        Damping = 2 # Hyperparameter we will have to adjust
+
         tx = position[0]
         ty = position[1]
         if self.trial:
             self.trial, self.tx_old, self.ty_old = False, tx, ty
-        
+
         delta_tx = tx - self.tx_old
         delta_ty = ty - self.ty_old
         self.tx_old,self.ty_old = tx,ty
-        
+
         if (gesture == 3):
             self.flag = 0
-            mx = mx_old + (delta_tx*sx) // (camx*Damping)
-            my = my_old + (delta_ty*sy) // (camy*Damping)            
-            pyautogui.moveTo(mx,my, duration = 0.1)
+            if math.hypot(delta_tx, delta_ty) <= deadzone / max(1.0, sx / camx):
+                return
+            mx = mx_old + (delta_tx * sx * speed) / (camx * 2)
+            my = my_old + (delta_ty * sy * speed) / (camy * 2)
+            mx = max(1, min(sx - 2, mx))
+            my = max(1, min(sy - 2, my))
+            pyautogui.moveTo(int(mx), int(my), duration = glide)
 
         elif(gesture == 0):
             if self.flag == 0:
-                pyautogui.doubleClick()
+                if clicks["enable_double_click"]:
+                    pyautogui.doubleClick()
                 self.flag = 1
         elif(gesture == 1):
-            print('1 Finger Open')
-        
-        
-        
+            LOGGER.debug("One finger open")
 
 
 class GestureController:
+    """Glove tracking engine with the same lifecycle contract as the
+    bare-hand :class:`Gesture_Controller.GestureController`."""
+
     gc_mode = 0
-    pyautogui.FAILSAFE = False
+    cap = None
     f_start_time = 0
     f_now_time = 0
-    
+
     cam_width  = 0
     cam_height = 0
-    
-    aru_marker = Marker()
-    hand_roi = ROI(2.5, 2.5, 6, 0.45, 0.6, 0.4)
-    glove = Glove()
-    csrt_track = Tracker()
-    mouse = Mouse()
-    
-    def __init__(self):
-        GestureController.cap = cv2.VideoCapture(0)
-        if GestureController.cap.isOpened():
-            GestureController.cam_width  = int( GestureController.cap.get(cv2.CAP_PROP_FRAME_WIDTH) )
-            GestureController.cam_height = int( GestureController.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) )
-        else:
-            print("CANNOT OPEN CAMERA")
-        
-        GestureController.gc_mode = 1
-        GestureController.f_start_time = time.time()
-        GestureController.f_now_time = time.time()
-        
+
+    # Built on first use: calibration reads image files from disk and must not
+    # run at import time.
+    aru_marker = None
+    hand_roi = None
+    glove = None
+    csrt_track = None
+    mouse = None
+
+    _stop_event = threading.Event()
+    _build_lock = threading.Lock()
+
+    def __init__(self, settings=None, status_callback=None):
+        self.settings = settings or get_settings()
+        self.status_callback = status_callback
+        self._fps = 0.0
+
+    @classmethod
+    def stop(cls):
+        """Ask a running engine to shut down. Safe to call from any thread."""
+        cls._stop_event.set()
+        cls.gc_mode = 0
+
+    @classmethod
+    def should_run(cls):
+        return not cls._stop_event.is_set()
+
+    @classmethod
+    def _build_components(cls):
+        with cls._build_lock:
+            if cls.aru_marker is None:
+                cls.aru_marker = Marker()
+                cls.hand_roi = ROI(2.5, 2.5, 6, 0.45, 0.6, 0.4)
+                cls.glove = Glove()
+                cls.csrt_track = Tracker()
+                cls.mouse = Mouse()
+
+    def _emit(self, **status):
+        if self.status_callback is None:
+            return
+        payload = {
+            "running": bool(GestureController.gc_mode),
+            "paused": False,
+            "fps": round(self._fps, 1),
+        }
+        payload.update(status)
+        try:
+            self.status_callback(payload)
+        except Exception:
+            LOGGER.exception("Status callback failed")
+
     def start(self):
-        while (True):
-            #mode checking
-            if not GestureController.gc_mode:
-                print('Exiting Gesture Controller')
-                break
-            #fps control
-            fps = 30.0
-            GestureController.f_start_time = time.time()
-            while (GestureController.f_now_time-GestureController.f_start_time <= 1.0/fps):
-                GestureController.f_now_time = time.time()
-            
-            #read camera
-            ret, frame = GestureController.cap.read()
-            frame = cv2.flip(frame, 1)
-            
-            #detect Marker, find ROI, find glove HSV, get FinalMask on glove
-            GestureController.aru_marker.detect(frame)
-            if GestureController.aru_marker.is_detected():
-                GestureController.csrt_track.corners_to_tracker(GestureController.aru_marker.corners)
-                GestureController.csrt_track.CSRT_tracker(frame)
-                
-            else:
-                GestureController.csrt_track.tracker_bbox = None
-                GestureController.csrt_track.CSRT_tracker(frame)
-                GestureController.aru_marker.corners = GestureController.csrt_track.tracker_to_corner(GestureController.aru_marker.corners)
-            
-            if GestureController.aru_marker.is_detected():
-                GestureController.hand_roi.findROI(frame, GestureController.aru_marker)
-                GestureController.hand_roi.find_glove_hsv(frame, GestureController.aru_marker)
-                FinalMask = GestureController.hand_roi.cropROI(frame)
-                GestureController.glove.find_fingers(FinalMask)
-                GestureController.glove.find_gesture(frame)
-                GestureController.mouse.move_mouse(frame,GestureController.hand_roi.marker_top,GestureController.glove.gesture)
-            
-            #draw call
-            if GestureController.aru_marker.is_detected():
-                GestureController.aru_marker.draw_marker(frame)
-                draw_box(frame, GestureController.hand_roi.roi_corners, (255,0,0))
-                draw_box(frame, GestureController.hand_roi.hsv_corners, (0,0,250))
-                cv2.imshow('FinalMask',FinalMask)
-            
-            #display frame
-            cv2.imshow('frame',frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        # When everything done, release the capture
-        GestureController.cap.release()
-        cv2.destroyAllWindows()
-        
-        
-        
+        GestureController._stop_event.clear()
+        GestureController.gc_mode = 1
+
+        config = self.settings.snapshot()
+        pyautogui.FAILSAFE = bool(config["safety"]["failsafe_corner"])
+
+        GestureController._build_components()
+        GestureController.mouse.reset()
+
+        capture = None
+        camera_config = None
+        failed_reads = 0
+
+        LOGGER.info("Glove gesture control started")
+        self._emit(message="Glove gesture control started")
+
+        try:
+            while GestureController.should_run():
+                frame_started = time.perf_counter()
+                config = self.settings.snapshot()
+                camera = config["camera"]
+                pyautogui.FAILSAFE = bool(config["safety"]["failsafe_corner"])
+
+                wanted_camera = (
+                    int(camera["device_index"]),
+                    int(camera["width"]),
+                    int(camera["height"]),
+                )
+                if wanted_camera != camera_config:
+                    if capture is not None:
+                        capture.release()
+                    capture = open_camera(*wanted_camera)
+                    camera_config = wanted_camera
+                    GestureController.cap = capture
+                    GestureController.cam_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    GestureController.cam_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    LOGGER.info("Using camera %s at %sx%s", *wanted_camera)
+
+                ret, frame = capture.read()
+                if not ret or frame is None:
+                    failed_reads += 1
+                    if failed_reads > 30:
+                        raise CameraError(
+                            "The camera stopped returning frames. It may have been "
+                            "unplugged or taken over by another application."
+                        )
+                    time.sleep(0.01)
+                    continue
+                failed_reads = 0
+
+                if camera["mirror"]:
+                    frame = cv2.flip(frame, 1)
+
+                #detect Marker, find ROI, find glove HSV, get FinalMask on glove
+                FinalMask = None
+                GestureController.aru_marker.detect(frame)
+                if GestureController.aru_marker.is_detected():
+                    GestureController.csrt_track.corners_to_tracker(GestureController.aru_marker.corners)
+                    GestureController.csrt_track.CSRT_tracker(frame)
+                else:
+                    GestureController.csrt_track.tracker_bbox = None
+                    GestureController.csrt_track.CSRT_tracker(frame)
+                    GestureController.aru_marker.corners = GestureController.csrt_track.tracker_to_corner(GestureController.aru_marker.corners)
+
+                if GestureController.aru_marker.is_detected():
+                    try:
+                        GestureController.hand_roi.findROI(frame, GestureController.aru_marker)
+                        GestureController.hand_roi.find_glove_hsv(frame, GestureController.aru_marker)
+                        FinalMask = GestureController.hand_roi.cropROI(frame)
+                        GestureController.glove.find_fingers(FinalMask)
+                        GestureController.glove.find_gesture(frame)
+                        GestureController.mouse.move_mouse(
+                            frame,
+                            GestureController.hand_roi.marker_top,
+                            GestureController.glove.gesture,
+                            config,
+                        )
+                    except (cv2.error, ValueError, IndexError, ZeroDivisionError):
+                        LOGGER.debug("Skipping frame, glove could not be analysed",
+                                     exc_info=True)
+                        FinalMask = None
+
+                if camera["show_preview"]:
+                    if GestureController.aru_marker.is_detected():
+                        GestureController.aru_marker.draw_marker(frame)
+                        draw_box(frame, GestureController.hand_roi.roi_corners, (255,0,0))
+                        draw_box(frame, GestureController.hand_roi.hsv_corners, (0,0,250))
+                        if FinalMask is not None:
+                            cv2.imshow('AirClick Glove Mask', FinalMask)
+                    cv2.imshow('AirClick Preview', frame)
+                    if cv2.waitKey(1) & 0xFF in (13, 27, ord('q')):
+                        LOGGER.info("Preview window closed by the user")
+                        break
+
+                elapsed = time.perf_counter() - frame_started
+                self._fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                budget = 1.0 / max(1, int(camera["fps_cap"]))
+                if elapsed < budget:
+                    time.sleep(budget - elapsed)
+                self._emit(gesture=str(GestureController.glove.gesture))
+
+        except pyautogui.FailSafeException:
+            LOGGER.warning("Corner failsafe triggered, stopping glove control")
+            self._emit(message="Failsafe triggered, gesture control stopped")
+        except CameraError as exc:
+            LOGGER.error("%s", exc)
+            self._emit(message=str(exc))
+        except Exception as exc:  # a failure here must not take the app down
+            LOGGER.exception("Glove gesture control stopped unexpectedly")
+            self._emit(message="Gesture control stopped: {}".format(exc))
+        finally:
+            GestureController.gc_mode = 0
+            GestureController._stop_event.set()
+            if capture is not None:
+                capture.release()
+            GestureController.cap = None
+            if camera_config is not None:
+                cv2.destroyAllWindows()
+                cv2.waitKey(1)
+            LOGGER.info("Glove gesture control stopped")
+            self._emit(running=False, message="Gesture control stopped")
+
+
+if __name__ == "__main__":
+    from airclick_settings import configure_logging
+
+    configure_logging()
+    GestureController().start()
