@@ -70,6 +70,16 @@ sys.modules["pyautogui"] = pyautogui_stub
 # --- stubs used only when the real package is missing ----------------------
 
 sys.modules.setdefault("cv2", _module("cv2", CAP_DSHOW=700, CAP_ANY=0))
+if not hasattr(sys.modules["cv2"], "aruco"):
+    aruco_stub = _module(
+        "cv2.aruco",
+        DICT_4X4_50=0,
+        getPredefinedDictionary=lambda dict_type: ("dictionary", dict_type),
+        DetectorParameters=lambda: types.SimpleNamespace(adaptiveThreshConstant=None),
+    )
+    sys.modules["cv2.aruco"] = aruco_stub
+    sys.modules["cv2"].aruco = aruco_stub
+    sys.modules["cv2"].error = type("error", (Exception,), {})
 sys.modules.setdefault(
     "mediapipe",
     _module("mediapipe", solutions=types.SimpleNamespace(drawing_utils=None, hands=None)),
