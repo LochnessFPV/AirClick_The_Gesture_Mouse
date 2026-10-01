@@ -6,6 +6,7 @@ dependencies are only stubbed when they are not installed; pyautogui is always
 replaced, because a test must never move the real cursor.
 """
 
+import importlib
 import os
 import sys
 import tempfile
@@ -26,6 +27,7 @@ os.environ["AIRCLICK_SETTINGS"] = os.path.join(
 
 def _module(name, **attributes):
     module = types.ModuleType(name)
+    module.__airclick_stub__ = True
     for key, value in attributes.items():
         setattr(module, key, value)
     return module
@@ -69,7 +71,24 @@ sys.modules["pyautogui"] = pyautogui_stub
 
 # --- stubs used only when the real package is missing ----------------------
 
-sys.modules.setdefault("cv2", _module("cv2", CAP_DSHOW=700, CAP_ANY=0))
+
+def _ensure(name, **attributes):
+    """Import ``name`` for real, falling back to a stub when it is missing.
+
+    Stubbing unconditionally would shadow genuinely installed packages, and a
+    fake ``google`` module in particular breaks the real ``google.protobuf``
+    namespace package that mediapipe needs.
+    """
+    if name in sys.modules:
+        return
+    try:
+        importlib.import_module(name)
+    except Exception:
+        sys.modules[name] = _module(name, **attributes)
+
+
+# pyscreeze (via pyautogui) reads cv2.__version__, so the stub must have one.
+_ensure("cv2", CAP_DSHOW=700, CAP_ANY=0, __version__="4.11.0")
 if not hasattr(sys.modules["cv2"], "aruco"):
     aruco_stub = _module(
         "cv2.aruco",
@@ -79,56 +98,34 @@ if not hasattr(sys.modules["cv2"], "aruco"):
     )
     sys.modules["cv2.aruco"] = aruco_stub
     sys.modules["cv2"].aruco = aruco_stub
+if not hasattr(sys.modules["cv2"], "error"):
     sys.modules["cv2"].error = type("error", (Exception,), {})
-sys.modules.setdefault(
-    "mediapipe",
-    _module("mediapipe", solutions=types.SimpleNamespace(drawing_utils=None, hands=None)),
-)
-sys.modules.setdefault("comtypes", _module("comtypes", CLSCTX_ALL=None))
-sys.modules.setdefault("pycaw", _module("pycaw"))
-sys.modules.setdefault(
-    "pycaw.pycaw", _module("pycaw.pycaw", AudioUtilities=object, IAudioEndpointVolume=object)
-)
-sys.modules.setdefault("google", _module("google"))
-sys.modules.setdefault("google.protobuf", _module("google.protobuf"))
-sys.modules.setdefault(
-    "google.protobuf.json_format",
-    _module("google.protobuf.json_format", MessageToDict=lambda message: message),
-)
-sys.modules.setdefault("screen_brightness_control", _module("screen_brightness_control"))
 
-sys.modules.setdefault(
+_ensure("mediapipe", solutions=types.SimpleNamespace(drawing_utils=None, hands=None))
+_ensure("comtypes", CLSCTX_ALL=None)
+_ensure("pycaw.pycaw", AudioUtilities=object, IAudioEndpointVolume=object)
+_ensure("google.protobuf.json_format", MessageToDict=lambda message: message)
+_ensure("screen_brightness_control")
+_ensure(
     "speech_recognition",
-    _module(
-        "speech_recognition",
-        Recognizer=type("Recognizer", (), {"listen": lambda *a, **k: None}),
-        Microphone=object,
-        RequestError=type("RequestError", (Exception,), {}),
-        UnknownValueError=type("UnknownValueError", (Exception,), {}),
-    ),
+    Recognizer=type("Recognizer", (), {"listen": lambda *a, **k: None}),
+    Microphone=object,
+    RequestError=type("RequestError", (Exception,), {}),
+    UnknownValueError=type("UnknownValueError", (Exception,), {}),
 )
-sys.modules.setdefault("pynput", _module("pynput"))
-sys.modules.setdefault(
+_ensure(
     "pynput.keyboard",
-    _module(
-        "pynput.keyboard",
-        Key=types.SimpleNamespace(ctrl="ctrl"),
-        Controller=type("Controller", (), {}),
-        GlobalHotKeys=type("GlobalHotKeys", (), {}),
-    ),
+    Key=types.SimpleNamespace(ctrl="ctrl"),
+    Controller=type("Controller", (), {}),
+    GlobalHotKeys=type("GlobalHotKeys", (), {}),
 )
-
-if "eel" not in sys.modules:
-    try:
-        import eel  # noqa: F401
-    except ImportError:
-        sys.modules["eel"] = _module(
-            "eel",
-            expose=lambda fn: fn,
-            init=lambda *a, **k: None,
-            start=lambda *a, **k: None,
-            sleep=lambda *a, **k: None,
-        )
+_ensure(
+    "eel",
+    expose=lambda fn: fn,
+    init=lambda *a, **k: None,
+    start=lambda *a, **k: None,
+    sleep=lambda *a, **k: None,
+)
 
 
 @pytest.fixture(autouse=True)

@@ -25,13 +25,21 @@ from airclick_settings import get_settings
 
 LOGGER = logging.getLogger("airclick.gestures")
 
+if not hasattr(mp, "solutions"):
+    raise ImportError(
+        "This version of mediapipe ({}) has removed the hand solutions API that "
+        "AirClick uses. Install a supported release with:\n"
+        "    pip install \"mediapipe>=0.10.9,<0.10.22\"".format(
+            getattr(mp, "__version__", "unknown")
+        )
+    )
+
 # Every pyautogui call sleeps for PAUSE seconds by default, adding about 100 ms
 # of lag to each cursor update; the frame-rate limiter paces the engine instead.
 pyautogui.PAUSE = 0
 
 mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
-
 # Cursor acceleration curve, preserved from the original tuning.
 _ACCEL_GAIN = 0.07
 _ACCEL_CEILING = 2.1

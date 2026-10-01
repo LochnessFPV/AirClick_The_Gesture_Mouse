@@ -1,7 +1,7 @@
 # Core
 numpy>=1.23,<2.0
 opencv-contrib-python>=4.8,<5.0   # cv2.aruco is required by the glove engine
-mediapipe>=0.10.9,<0.11
+mediapipe>=0.10.9,<0.10.22        # 0.10.22+ removed the hand solutions API
 protobuf>=3.20,<5.0
 
 # Input and output control
@@ -11,6 +11,7 @@ screen-brightness-control>=0.22,<1.0
 
 # User interface
 eel>=0.16.0,<1.0
+gevent<25                         # 25.x publishes no wheels for Python 3.9
 
 # Voice assistant
 SpeechRecognition>=3.10,<4.0

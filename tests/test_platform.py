@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import airclick_platform as system
 
 

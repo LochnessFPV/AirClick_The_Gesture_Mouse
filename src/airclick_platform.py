@@ -81,14 +81,20 @@ class VolumeControl:
         if self._interface is not None or self._unavailable:
             return self._interface
         try:
-            from ctypes import POINTER, cast
+            from pycaw.pycaw import AudioUtilities
 
-            from comtypes import CLSCTX_ALL
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            device = AudioUtilities.GetSpeakers()
+            if hasattr(device, "EndpointVolume"):
+                # pycaw 2023+ wraps the device and exposes the interface directly.
+                self._interface = device.EndpointVolume
+            else:
+                from ctypes import POINTER, cast
 
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            self._interface = cast(interface, POINTER(IAudioEndpointVolume))
+                from comtypes import CLSCTX_ALL
+                from pycaw.pycaw import IAudioEndpointVolume
+
+                interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self._interface = cast(interface, POINTER(IAudioEndpointVolume))
         except Exception:
             LOGGER.warning("System volume control is unavailable", exc_info=True)
             self._unavailable = True
