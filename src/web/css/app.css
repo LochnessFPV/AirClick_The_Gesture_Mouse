@@ -1,0 +1,225 @@
+:root {
+    --bg: #11151c;
+    --panel: #1b212b;
+    --panel-alt: #232b38;
+    --line: #2e3744;
+    --text: #e8edf4;
+    --muted: #93a1b5;
+    --accent: #4da3ff;
+    --ok: #3ddc97;
+    --warn: #ffb648;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+}
+
+.app-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+}
+
+.app-header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0;
+    flex: 1;
+}
+
+.status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #5a6678;
+}
+
+.status-dot.on { background: var(--ok); }
+.status-dot.paused { background: var(--warn); }
+
+.tabs {
+    display: flex;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+}
+
+.tabs button {
+    flex: 1;
+    padding: 10px 0;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--muted);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.tabs button[aria-selected="true"] {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+}
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.toolbar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel-alt);
+}
+
+button.primary,
+button.secondary {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #06111f;
+    font-weight: 600;
+}
+
+button.secondary {
+    background: var(--panel);
+    color: var(--text);
+}
+
+button:disabled { opacity: 0.5; cursor: default; }
+
+.status-line {
+    padding: 8px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    min-height: 16px;
+}
+
+.settings-body {
+    padding: 4px 14px 16px;
+    overflow-y: auto;
+    max-height: calc(100vh - 230px);
+}
+
+.settings-section {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-top: 12px;
+    background: var(--panel);
+}
+
+.settings-section > summary {
+    padding: 10px 12px;
+    font-weight: 600;
+    cursor: pointer;
+    list-style: none;
+}
+
+.settings-section > summary::-webkit-details-marker { display: none; }
+.settings-section > summary::before { content: "\25B8  "; color: var(--muted); }
+.settings-section[open] > summary::before { content: "\25BE  "; }
+
+.setting {
+    padding: 8px 12px 12px;
+    border-top: 1px solid var(--line);
+}
+
+.setting label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.setting .value {
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    min-width: 46px;
+    text-align: right;
+}
+
+.setting .help {
+    display: block;
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+.setting input[type="range"] { width: 100%; margin-top: 8px; }
+
+.setting select {
+    margin-top: 6px;
+    width: 100%;
+    padding: 6px;
+    background: var(--panel-alt);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+}
+
+.profiles {
+    display: flex;
+    gap: 6px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.profiles select { flex: 1; min-width: 110px; }
+
+.profiles input {
+    flex: 1;
+    min-width: 110px;
+    padding: 6px;
+    background: var(--panel-alt);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+}
+
+.chat-wrapper { padding: 10px 14px; }
+
+#messages {
+    overflow-y: auto;
+    height: calc(100vh - 230px);
+}
+
+#messages .message {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.toast {
+    margin: 10px 14px 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    background: rgba(255, 182, 72, 0.14);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+}
+
+.toast:empty { display: none; }
