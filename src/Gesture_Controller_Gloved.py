@@ -723,10 +723,11 @@ class GestureController:
                         break
 
                 elapsed = time.perf_counter() - frame_started
-                self._fps = 1.0 / elapsed if elapsed > 0 else 0.0
                 budget = 1.0 / max(1, int(camera["fps_cap"]))
                 if elapsed < budget:
                     time.sleep(budget - elapsed)
+                cycle = time.perf_counter() - frame_started
+                self._fps = 1.0 / cycle if cycle > 0 else 0.0
                 self._emit(gesture=str(GestureController.glove.gesture))
 
         except pyautogui.FailSafeException:

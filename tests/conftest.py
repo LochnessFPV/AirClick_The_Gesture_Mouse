@@ -8,6 +8,7 @@ replaced, because a test must never move the real cursor.
 
 import os
 import sys
+import tempfile
 import types
 
 import pytest
@@ -15,6 +16,12 @@ import pytest
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
+
+# Redirect the settings file before anything calls get_settings(), so a test
+# run never reads or writes the user's real configuration.
+os.environ["AIRCLICK_SETTINGS"] = os.path.join(
+    tempfile.mkdtemp(prefix="airclick-tests-"), "settings.json"
+)
 
 
 def _module(name, **attributes):

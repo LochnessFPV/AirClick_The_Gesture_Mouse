@@ -153,7 +153,6 @@ function buildControl(section, option) {
         label.appendChild(input);
         wrapper.appendChild(label);
     } else if (option.kind === "choice") {
-        label.appendChild(document.createElement("span"));
         wrapper.appendChild(label);
         const select = document.createElement("select");
         select.id = "setting-" + section.id + "-" + option.id;

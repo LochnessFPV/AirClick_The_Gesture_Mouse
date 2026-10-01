@@ -36,6 +36,7 @@ WAKE_WORD = "proton"
 BROWSE_ROOT = Path.home()
 
 # ----------------Variables------------------------
+is_awake = True  # Bot status
 file_exp_status = False
 files = []
 path = BROWSE_ROOT
@@ -271,6 +272,9 @@ def handle_file_navigation(voice_data):
         file_exp_status = False
         reply("Closed the file browser.")
 
+    else:
+        reply("Say open and a number, back, or close.")
+
 
 def open_file(target):
     """Open a file, keeping it inside the folder being browsed."""
@@ -293,9 +297,6 @@ def confirm_pending_open(voice_data):
 
 
 # ------------------Driver Code--------------------
-
-
-is_awake = True  # Bot status
 
 
 def read_command():

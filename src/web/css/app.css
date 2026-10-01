@@ -16,6 +16,7 @@ body {
     color: var(--text);
     font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 14px;
+    overflow: hidden;
 }
 
 .app-header {
@@ -202,12 +203,21 @@ button:disabled { opacity: 0.5; cursor: default; }
 
 .chat-wrapper { padding: 10px 14px; }
 
-#messages {
-    overflow-y: auto;
-    height: calc(100vh - 230px);
+#convForm { display: flex; align-items: center; }
+
+input.userInputDynamic {
+    flex: 1;
+    width: auto !important;
 }
 
-#messages .message {
+/* jquery.convform.css sets these with !important, so match its specificity. */
+div.conv-form-wrapper div#messages {
+    max-height: calc(100vh - 300px);
+    min-height: 120px;
+    overflow-y: auto;
+}
+
+div.conv-form-wrapper div#messages div.message {
     white-space: pre-wrap;
     word-break: break-word;
 }

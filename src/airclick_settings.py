@@ -355,9 +355,9 @@ class Settings:
     def reset(self, section: Optional[str] = None, save: bool = True) -> None:
         """Restore defaults for one section, or for everything."""
         defaults = default_values()
-        payload = {section: defaults[section]} if section else defaults
-        if section and section not in defaults:
+        if section is not None and section not in defaults:
             raise SettingsError(f"Unknown settings section '{section}'")
+        payload = {section: defaults[section]} if section else defaults
         self.update(payload, save=save)
 
     # -------------------------------------------------------------- profiles
