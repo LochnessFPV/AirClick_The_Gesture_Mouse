@@ -1,19 +1,47 @@
-# Imports
+"""Hand-tracking gesture engine.
+
+Captures webcam frames, turns MediaPipe hand landmarks into gestures and maps
+those gestures onto mouse, scroll, volume and brightness actions.
+
+Everything that used to be a hard-coded constant now comes from
+:mod:`airclick_settings` and is re-read every frame, so the settings UI can
+retune the engine while it is running.
+"""
+
+import logging
+import math
+import threading
+import time
+from enum import IntEnum
+from typing import Callable, Dict, List
 
 import cv2
 import mediapipe as mp
 import pyautogui
-import math
-from enum import IntEnum
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from google.protobuf.json_format import MessageToDict
-import screen_brightness_control as sbcontrol
 
-pyautogui.FAILSAFE = False
+import airclick_platform as system
+from airclick_settings import get_settings
+
+LOGGER = logging.getLogger("airclick.gestures")
+
+# Every pyautogui call sleeps for PAUSE seconds by default, adding about 100 ms
+# of lag to each cursor update; the frame-rate limiter paces the engine instead.
+pyautogui.PAUSE = 0
+
 mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
+
+# Cursor acceleration curve, preserved from the original tuning.
+_ACCEL_GAIN = 0.07
+_ACCEL_CEILING = 2.1
+
+StatusCallback = Callable[[Dict[str, object]], None]
+
+
+class CameraError(RuntimeError):
+    """Raised when the configured webcam cannot be opened or read."""
+
 
 # Gesture Encodings 
 class Gest(IntEnum):
@@ -50,7 +78,7 @@ class HandRecog:
     Convert Mediapipe Landmarks to recognizable Gestures.
     """
     
-    def __init__(self, hand_label):
+    def __init__(self, hand_label, stability_frames: int = 4):
         """
         Constructs all the necessary attributes for the HandRecog object.
 
@@ -71,6 +99,8 @@ class HandRecog:
                 Landmarks obtained from mediapipe.
             hand_label : int
                 Represents multi-handedness corresponding to Enum 'HLabel'.
+            stability_frames : int
+                Frames a gesture must persist for before it is accepted.
         """
 
         self.finger = 0
@@ -79,6 +109,7 @@ class HandRecog:
         self.frame_count = 0
         self.hand_result = None
         self.hand_label = hand_label
+        self.stability_frames = max(1, int(stability_frames))
     
     def update_hand_result(self, hand_result):
         self.hand_result = hand_result
@@ -148,21 +179,19 @@ class HandRecog:
         -------
         None
         """
-        if self.hand_result == None:
+        if self.hand_result is None:
             return
 
         points = [[8,5,0],[12,9,0],[16,13,0],[20,17,0]]
         self.finger = 0
         self.finger = self.finger | 0 #thumb
-        for idx,point in enumerate(points):
-            
+        for point in points:
             dist = self.get_signed_dist(point[:2])
             dist2 = self.get_signed_dist(point[1:])
-            
-            try:
-                ratio = round(dist/dist2, 1)
-            except:
-                ratio = round(dist/0.01, 1)
+
+            # A perfectly straight finger collapses the knuckle-to-knuckle
+            # distance to zero; fall back to a small epsilon.
+            ratio = round(dist / (dist2 if dist2 else 0.01), 1)
 
             self.finger = self.finger << 1
             if ratio > 0.5 :
@@ -180,7 +209,7 @@ class HandRecog:
         -------
         int
         """
-        if self.hand_result == None:
+        if self.hand_result is None:
             return Gest.PALM
 
         current_gesture = Gest.PALM
@@ -191,18 +220,16 @@ class HandRecog:
                 current_gesture = Gest.PINCH_MAJOR
 
         elif Gest.FIRST2 == self.finger :
-            point = [[8,12],[5,9]]
-            dist1 = self.get_dist(point[0])
-            dist2 = self.get_dist(point[1])
-            ratio = dist1/dist2
+            dist1 = self.get_dist([8,12])
+            dist2 = self.get_dist([5,9])
+            ratio = dist1 / dist2 if dist2 else 0.0
             if ratio > 1.7:
                 current_gesture = Gest.V_GEST
+            elif self.get_dz([8,12]) < 0.1:
+                current_gesture =  Gest.TWO_FINGER_CLOSED
             else:
-                if self.get_dz([8,12]) < 0.1:
-                    current_gesture =  Gest.TWO_FINGER_CLOSED
-                else:
-                    current_gesture =  Gest.MID
-            
+                current_gesture =  Gest.MID
+
         else:
             current_gesture =  self.finger
         
@@ -213,7 +240,7 @@ class HandRecog:
 
         self.prev_gesture = current_gesture
 
-        if self.frame_count > 4 :
+        if self.frame_count >= self.stability_frames:
             self.ori_gesture = current_gesture
         return self.ori_gesture
 
@@ -222,12 +249,13 @@ class Controller:
     """
     Executes commands according to detected gestures.
 
+    All tuning values (pointer speed, smoothing, dead zone, pinch sensitivity,
+    step sizes and the per-action on/off switches) are read from the live
+    settings snapshot supplied by :class:`GestureController`, so changes made in
+    the settings UI take effect on the very next frame.
+
     Attributes
     ----------
-    tx_old : int
-        previous mouse location x coordinate
-    ty_old : int
-        previous mouse location y coordinate
     flag : bool
         true if V gesture is detected
     grabflag : bool
@@ -257,13 +285,12 @@ class Controller:
         stores no. of frames since 'pinchlv' is updated.
     prev_hand : tuple
         stores (x, y) coordinates of hand in previous frame.
+    smoothed_hand : tuple
+        low-pass filtered hand position, used to damp tremor.
     pinch_threshold : float
         step size for quantization of 'pinchlv'.
     """
 
-    tx_old = 0
-    ty_old = 0
-    trial = True
     flag = False
     grabflag = False
     pinchmajorflag = False
@@ -275,8 +302,36 @@ class Controller:
     pinchlv = 0
     framecount = 0
     prev_hand = None
+    smoothed_hand = None
     pinch_threshold = 0.3
-    
+
+    # Settings snapshot for the frame currently being processed.
+    _config: Dict[str, Dict[str, object]] = {}
+
+    @classmethod
+    def configure(cls, config):
+        """Point the controller at the settings snapshot for this frame."""
+        cls._config = config
+        cls.pinch_threshold = float(config["clicks"]["pinch_sensitivity"])
+
+    @classmethod
+    def reset(cls):
+        """Release any held mouse button and forget per-session state."""
+        if cls.grabflag:
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception:
+                LOGGER.debug("Could not release the mouse button", exc_info=True)
+        cls.flag = False
+        cls.grabflag = False
+        cls.pinchmajorflag = False
+        cls.pinchminorflag = False
+        cls.prev_hand = None
+        cls.smoothed_hand = None
+        cls.framecount = 0
+        cls.pinchlv = 0
+        cls.prevpinchlv = 0
+
     def getpinchylv(hand_result):
         """returns distance beween starting pinch y coord and current hand position y coord."""
         dist = round((Controller.pinchstartycoord - hand_result.landmark[8].y)*10,1)
@@ -288,77 +343,98 @@ class Controller:
         return dist
     
     def changesystembrightness():
-        """sets system brightness based on 'Controller.pinchlv'."""
-        currentBrightnessLv = sbcontrol.get_brightness(display=0)/100.0
-        currentBrightnessLv += Controller.pinchlv/50.0
-        if currentBrightnessLv > 1.0:
-            currentBrightnessLv = 1.0
-        elif currentBrightnessLv < 0.0:
-            currentBrightnessLv = 0.0       
-        sbcontrol.fade_brightness(int(100*currentBrightnessLv) , start = sbcontrol.get_brightness(display=0))
-    
+        """Nudges screen brightness based on 'Controller.pinchlv'."""
+        media = Controller._config.get("scroll", {})
+        if not media.get("enable_brightness", True):
+            return
+        step = float(media.get("brightness_step", 2.0)) / 100.0
+        system.brightness.adjust(Controller.pinchlv * step)
+
     def changesystemvolume():
-        """sets system volume based on 'Controller.pinchlv'."""
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        currentVolumeLv = volume.GetMasterVolumeLevelScalar()
-        currentVolumeLv += Controller.pinchlv/50.0
-        if currentVolumeLv > 1.0:
-            currentVolumeLv = 1.0
-        elif currentVolumeLv < 0.0:
-            currentVolumeLv = 0.0
-        volume.SetMasterVolumeLevelScalar(currentVolumeLv, None)
-    
+        """Nudges system volume based on 'Controller.pinchlv'."""
+        media = Controller._config.get("scroll", {})
+        if not media.get("enable_volume", True):
+            return
+        step = float(media.get("volume_step", 2.0)) / 100.0
+        system.volume.adjust(Controller.pinchlv * step)
+
     def scrollVertical():
         """scrolls on screen vertically."""
-        pyautogui.scroll(120 if Controller.pinchlv>0.0 else -120)
-        
-    
+        media = Controller._config.get("scroll", {})
+        if not media.get("enable_scroll", True):
+            return
+        step = int(media.get("scroll_step", 120))
+        pyautogui.scroll(step if Controller.pinchlv > 0.0 else -step)
+
     def scrollHorizontal():
         """scrolls on screen horizontally."""
+        media = Controller._config.get("scroll", {})
+        if not media.get("enable_scroll", True):
+            return
+        step = int(media.get("scroll_step", 120))
         pyautogui.keyDown('shift')
-        pyautogui.keyDown('ctrl')
-        pyautogui.scroll(-120 if Controller.pinchlv>0.0 else 120)
-        pyautogui.keyUp('ctrl')
-        pyautogui.keyUp('shift')
+        try:
+            pyautogui.scroll(-step if Controller.pinchlv > 0.0 else step)
+        finally:
+            pyautogui.keyUp('shift')
 
     # Locate Hand to get Cursor Position
-    # Stabilize cursor by Dampening
+    # Stabilize cursor by smoothing, a dead zone and an acceleration curve
     def get_position(hand_result):
         """
         returns coordinates of current hand position.
 
-        Locates hand to get cursor position also stabilize cursor by 
-        dampening jerky motion of hand.
+        The raw landmark is low-pass filtered (the "Smoothness" setting), then
+        movements smaller than the dead zone are discarded, and what remains is
+        scaled by the acceleration curve and the pointer speed.
 
         Returns
         -------
-        tuple(float, float)
+        tuple(int, int)
         """
-        point = 9
-        position = [hand_result.landmark[point].x ,hand_result.landmark[point].y]
-        sx,sy = pyautogui.size()
-        x_old,y_old = pyautogui.position()
-        x = int(position[0]*sx)
-        y = int(position[1]*sy)
+        pointer = Controller._config.get("pointer", {})
+        smoothness = int(pointer.get("smoothness", 5))
+        deadzone = float(pointer.get("deadzone", 6))
+        speed = float(pointer.get("speed", 1.0))
+
+        screen_w, screen_h = pyautogui.size()
+        raw_x = hand_result.landmark[9].x * screen_w
+        raw_y = hand_result.landmark[9].y * screen_h
+
+        # smoothness 1 (snappy) -> alpha ~0.96, smoothness 10 (calm) -> ~0.10
+        alpha = max(0.08, min(1.0, 1.05 - smoothness * 0.095))
+        if Controller.smoothed_hand is None:
+            Controller.smoothed_hand = (raw_x, raw_y)
+        else:
+            prev_sx, prev_sy = Controller.smoothed_hand
+            Controller.smoothed_hand = (
+                prev_sx + alpha * (raw_x - prev_sx),
+                prev_sy + alpha * (raw_y - prev_sy),
+            )
+
+        x, y = Controller.smoothed_hand
         if Controller.prev_hand is None:
-            Controller.prev_hand = x,y
+            Controller.prev_hand = (x, y)
+
         delta_x = x - Controller.prev_hand[0]
         delta_y = y - Controller.prev_hand[1]
+        Controller.prev_hand = (x, y)
 
-        distsq = delta_x**2 + delta_y**2
-        ratio = 1
-        Controller.prev_hand = [x,y]
-
-        if distsq <= 25:
-            ratio = 0
-        elif distsq <= 900:
-            ratio = 0.07 * (distsq ** (1/2))
+        distance = math.hypot(delta_x, delta_y)
+        if distance <= deadzone:
+            ratio = 0.0
         else:
-            ratio = 2.1
-        x , y = x_old + delta_x*ratio , y_old + delta_y*ratio
-        return (x,y)
+            ratio = min(_ACCEL_CEILING, _ACCEL_GAIN * distance) * speed
+
+        cursor_x, cursor_y = pyautogui.position()
+        target_x = cursor_x + delta_x * ratio
+        target_y = cursor_y + delta_y * ratio
+
+        # Stay a pixel clear of the screen corners so gesture movement never
+        # trips the corner failsafe, which is reserved for the physical mouse.
+        target_x = max(1, min(screen_w - 2, target_x))
+        target_y = max(1, min(screen_h - 2, target_y))
+        return (int(target_x), int(target_y))
 
     def pinch_control_init(hand_result):
         """Initializes attributes for pinch gesture."""
@@ -387,7 +463,7 @@ class Controller:
         -------
         None
         """
-        if Controller.framecount == 5:
+        if Controller.framecount >= int(Controller._config.get("clicks", {}).get("pinch_hold_frames", 5)):
             Controller.framecount = 0
             Controller.pinchlv = Controller.prevpinchlv
 
@@ -418,6 +494,12 @@ class Controller:
 
     def handle_controls(gesture, hand_result):  
         """Impliments all gesture functionality."""      
+        if hand_result is None:
+            return
+
+        clicks = Controller._config.get("clicks", {})
+        glide = float(Controller._config.get("pointer", {}).get("glide", 0.05))
+
         x,y = None,None
         if gesture != Gest.PALM :
             x,y = Controller.get_position(hand_result)
@@ -436,24 +518,30 @@ class Controller:
         # implementation
         if gesture == Gest.V_GEST:
             Controller.flag = True
-            pyautogui.moveTo(x, y, duration = 0.1)
+            pyautogui.moveTo(x, y, duration = glide)
 
         elif gesture == Gest.FIST:
+            if not clicks.get("enable_drag", True):
+                pyautogui.moveTo(x, y, duration = glide)
+                return
             if not Controller.grabflag : 
                 Controller.grabflag = True
                 pyautogui.mouseDown(button = "left")
-            pyautogui.moveTo(x, y, duration = 0.1)
+            pyautogui.moveTo(x, y, duration = glide)
 
         elif gesture == Gest.MID and Controller.flag:
-            pyautogui.click()
+            if clicks.get("enable_left_click", True):
+                pyautogui.click()
             Controller.flag = False
 
         elif gesture == Gest.INDEX and Controller.flag:
-            pyautogui.click(button='right')
+            if clicks.get("enable_right_click", True):
+                pyautogui.click(button='right')
             Controller.flag = False
 
         elif gesture == Gest.TWO_FINGER_CLOSED and Controller.flag:
-            pyautogui.doubleClick()
+            if clicks.get("enable_double_click", True):
+                pyautogui.doubleClick()
             Controller.flag = False
 
         elif gesture == Gest.PINCH_MINOR:
@@ -468,6 +556,38 @@ class Controller:
                 Controller.pinchmajorflag = True
             Controller.pinch_control(hand_result,Controller.changesystembrightness, Controller.changesystemvolume)
         
+def open_camera(index, width, height):
+    """Open a webcam, preferring the fast DirectShow back end on Windows."""
+    backends = [cv2.CAP_DSHOW, cv2.CAP_ANY] if system.IS_WINDOWS else [cv2.CAP_ANY]
+    for backend in backends:
+        capture = cv2.VideoCapture(index, backend)
+        if capture.isOpened():
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            return capture
+        capture.release()
+    raise CameraError(
+        "Camera {} could not be opened. It may be missing, or in use by another "
+        "application.".format(index)
+    )
+
+
+def list_cameras(maximum: int = 5) -> List[int]:
+    """Return the indexes of the webcams that can currently be opened."""
+    if is_running():
+        # Probing would fight the running engine for the device.
+        return [int(get_settings().get("camera", "device_index"))]
+    available = []
+    for index in range(maximum):
+        try:
+            capture = open_camera(index, 640, 480)
+        except CameraError:
+            continue
+        available.append(index)
+        capture.release()
+    return available
+
+
 '''
 ----------------------------------------  Main Class  ----------------------------------------
     Entry point of Gesture Controller
@@ -476,14 +596,13 @@ class Controller:
 
 class GestureController:
     """
-    Handles camera, obtain landmarks from mediapipe, entry point
-    for whole program.
+    Owns the camera, obtains landmarks from mediapipe and drives 'Controller'.
 
     Attributes
     ----------
     gc_mode : int
-        indicates whether gesture controller is running or not,
-        1 if running, otherwise 0.
+        1 while the engine is running, otherwise 0. Kept for backwards
+        compatibility; 'is_running()' is the preferred check.
     cap : Object
         object obtained from cv2, for capturing video frame.
     CAM_HEIGHT : int
@@ -506,38 +625,98 @@ class GestureController:
     hr_minor = None # Left hand by default
     dom_hand = True
 
-    def __init__(self):
+    _stop_event = threading.Event()
+
+    def __init__(self, settings=None, status_callback=None):
         """Initializes attributes."""
-        GestureController.gc_mode = 1
-        GestureController.cap = cv2.VideoCapture(0)
-        GestureController.CAM_HEIGHT = GestureController.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        GestureController.CAM_WIDTH = GestureController.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    
+        self.settings = settings or get_settings()
+        self.status_callback = status_callback
+        self._hotkey_listener = None
+        self._paused = False
+        self._last_hand_seen = time.time()
+        self._fps = 0.0
+
+    # ------------------------------------------------------------- lifecycle
+
+    @classmethod
+    def stop(cls):
+        """Ask a running engine to shut down. Safe to call from any thread."""
+        cls._stop_event.set()
+        cls.gc_mode = 0
+
+    @classmethod
+    def should_run(cls):
+        return not cls._stop_event.is_set()
+
+    def _emit(self, **status):
+        if self.status_callback is None:
+            return
+        payload = {
+            "running": bool(GestureController.gc_mode),
+            "paused": self._paused,
+            "fps": round(self._fps, 1),
+        }
+        payload.update(status)
+        try:
+            self.status_callback(payload)
+        except Exception:
+            LOGGER.exception("Status callback failed")
+
+    def _start_panic_hotkey(self):
+        combo = str(self.settings.get("safety", "panic_hotkey"))
+        if combo == "none":
+            return
+        try:
+            from pynput import keyboard
+
+            sequence = "+".join(
+                "<{}>".format(part) if part in ("ctrl", "alt", "shift", "cmd") else part
+                for part in combo.split("+")
+            )
+            listener = keyboard.GlobalHotKeys({sequence: self._on_panic})
+            listener.daemon = True
+            listener.start()
+            self._hotkey_listener = listener
+            LOGGER.info("Panic hotkey armed: %s", combo)
+        except Exception:
+            LOGGER.warning("Could not register the panic hotkey %s", combo, exc_info=True)
+
+    def _on_panic(self):
+        LOGGER.warning("Panic hotkey pressed, stopping gesture control")
+        self._emit(message="Panic hotkey pressed, gesture control stopped")
+        GestureController.stop()
+
+    def _stop_panic_hotkey(self):
+        if self._hotkey_listener is not None:
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                LOGGER.debug("Could not stop the hotkey listener", exc_info=True)
+            self._hotkey_listener = None
+
+    # ------------------------------------------------------------ processing
+
     def classify_hands(results):
         """
         sets 'hr_major', 'hr_minor' based on classification(left, right) of 
         hand obtained from mediapipe, uses 'dom_hand' to decide major and
         minor hand.
         """
-        left , right = None,None
-        try:
-            handedness_dict = MessageToDict(results.multi_handedness[0])
-            if handedness_dict['classification'][0]['label'] == 'Right':
-                right = results.multi_hand_landmarks[0]
-            else :
-                left = results.multi_hand_landmarks[0]
-        except:
-            pass
+        left, right = None, None
+        handedness = getattr(results, "multi_handedness", None) or []
+        landmarks = getattr(results, "multi_hand_landmarks", None) or []
 
-        try:
-            handedness_dict = MessageToDict(results.multi_handedness[1])
-            if handedness_dict['classification'][0]['label'] == 'Right':
-                right = results.multi_hand_landmarks[1]
-            else :
-                left = results.multi_hand_landmarks[1]
-        except:
-            pass
-        
+        for index in range(min(len(handedness), len(landmarks))):
+            try:
+                label = MessageToDict(handedness[index])["classification"][0]["label"]
+            except (KeyError, IndexError, TypeError):
+                LOGGER.debug("Unreadable handedness entry %s", index)
+                continue
+            if label == "Right":
+                right = landmarks[index]
+            else:
+                left = landmarks[index]
+
         if GestureController.dom_hand == True:
             GestureController.hr_major = right
             GestureController.hr_minor = left
@@ -545,32 +724,112 @@ class GestureController:
             GestureController.hr_major = left
             GestureController.hr_minor = right
 
+    def _apply_runtime_settings(self, config):
+        GestureController.dom_hand = config["modes"]["dominant_hand"] == "right"
+        pyautogui.FAILSAFE = bool(config["safety"]["failsafe_corner"])
+        Controller.configure(config)
+
     def start(self):
         """
-        Entry point of whole program, captures video frame and passes, obtains
-        landmark from mediapipe and passes it to 'handmajor' and 'handminor' for
-        controlling.
+        Capture video frames, obtain landmarks from mediapipe and pass them to
+        'handmajor' and 'handminor' for controlling.
+
+        Runs until 'stop()' is called or the preview window is closed, and is
+        meant to be executed on its own thread.
         """
-        
-        handmajor = HandRecog(HLabel.MAJOR)
-        handminor = HandRecog(HLabel.MINOR)
+        GestureController._stop_event.clear()
+        GestureController.gc_mode = 1
+        Controller.reset()
+        self._paused = False
+        self._last_hand_seen = time.time()
 
-        with mp_hands.Hands(max_num_hands = 2,min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
-            while GestureController.cap.isOpened() and GestureController.gc_mode:
-                success, image = GestureController.cap.read()
+        config = self.settings.snapshot()
+        self._apply_runtime_settings(config)
+        self._start_panic_hotkey()
 
+        capture = None
+        hands = None
+        hands_config = None
+        camera_config = None
+        window_open = False
+        failed_reads = 0
+
+        stability = int(config["clicks"]["gesture_stability_frames"])
+        handmajor = HandRecog(HLabel.MAJOR, stability)
+        handminor = HandRecog(HLabel.MINOR, stability)
+
+        LOGGER.info("Gesture control started")
+        self._emit(message="Gesture control started")
+
+        try:
+            while GestureController.should_run():
+                frame_started = time.perf_counter()
+                config = self.settings.snapshot()
+                self._apply_runtime_settings(config)
+
+                camera = config["camera"]
+                wanted_camera = (
+                    int(camera["device_index"]),
+                    int(camera["width"]),
+                    int(camera["height"]),
+                )
+                if wanted_camera != camera_config:
+                    if capture is not None:
+                        capture.release()
+                    capture = open_camera(*wanted_camera)
+                    camera_config = wanted_camera
+                    GestureController.cap = capture
+                    GestureController.CAM_WIDTH = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+                    GestureController.CAM_HEIGHT = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                    LOGGER.info("Using camera %s at %sx%s", *wanted_camera)
+
+                modes = config["modes"]
+                wanted_hands = (
+                    float(modes["detection_confidence"]),
+                    float(modes["tracking_confidence"]),
+                )
+                if wanted_hands != hands_config:
+                    if hands is not None:
+                        hands.close()
+                    hands = mp_hands.Hands(
+                        max_num_hands=2,
+                        min_detection_confidence=wanted_hands[0],
+                        min_tracking_confidence=wanted_hands[1],
+                    )
+                    hands_config = wanted_hands
+
+                stability = int(config["clicks"]["gesture_stability_frames"])
+                handmajor.stability_frames = stability
+                handminor.stability_frames = stability
+
+                success, image = capture.read()
                 if not success:
-                    print("Ignoring empty camera frame.")
+                    failed_reads += 1
+                    if failed_reads > 30:
+                        raise CameraError(
+                            "The camera stopped returning frames. It may have been "
+                            "unplugged or taken over by another application."
+                        )
+                    LOGGER.debug("Ignoring empty camera frame")
+                    time.sleep(0.01)
                     continue
-                
-                image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
-                image.flags.writeable = False
-                results = hands.process(image)
-                
-                image.flags.writeable = True
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                failed_reads = 0
 
-                if results.multi_hand_landmarks:                   
+                if camera["mirror"]:
+                    image = cv2.flip(image, 1)
+
+                rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                rgb.flags.writeable = False
+                results = hands.process(rgb)
+
+                gesture_name = "none"
+                if results.multi_hand_landmarks:
+                    self._last_hand_seen = time.time()
+                    if self._paused:
+                        self._paused = False
+                        LOGGER.info("Hand detected, resuming")
+                        self._emit(message="Resumed")
+
                     GestureController.classify_hands(results)
                     handmajor.update_hand_result(GestureController.hr_major)
                     handminor.update_hand_result(GestureController.hr_minor)
@@ -580,21 +839,125 @@ class GestureController:
                     gest_name = handminor.get_gesture()
 
                     if gest_name == Gest.PINCH_MINOR:
-                        Controller.handle_controls(gest_name, handminor.hand_result)
+                        hand_result = handminor.hand_result
                     else:
                         gest_name = handmajor.get_gesture()
-                        Controller.handle_controls(gest_name, handmajor.hand_result)
-                    
-                    for hand_landmarks in results.multi_hand_landmarks:
-                        mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                        hand_result = handmajor.hand_result
+
+                    gesture_name = _gesture_label(gest_name)
+                    Controller.handle_controls(gest_name, hand_result)
+
+                    if camera["show_preview"]:
+                        for hand_landmarks in results.multi_hand_landmarks:
+                            mp_drawing.draw_landmarks(
+                                image, hand_landmarks, mp_hands.HAND_CONNECTIONS
+                            )
                 else:
                     Controller.prev_hand = None
-                cv2.imshow('Gesture Controller', image)
-                if cv2.waitKey(5) & 0xFF == 13:
-                    break
-        GestureController.cap.release()
-        cv2.destroyAllWindows()
+                    Controller.smoothed_hand = None
+                    auto_pause = float(config["safety"]["auto_pause_seconds"])
+                    if (
+                        auto_pause > 0
+                        and not self._paused
+                        and time.time() - self._last_hand_seen > auto_pause
+                    ):
+                        self._paused = True
+                        Controller.reset()
+                        LOGGER.info("No hand seen for %.1fs, pausing", auto_pause)
+                        self._emit(message="Paused, no hand detected")
 
-# uncomment to run directly
-# gc1 = GestureController()
-# gc1.start()
+                if camera["show_preview"]:
+                    cv2.imshow('AirClick Preview', image)
+                    window_open = True
+                    if cv2.waitKey(1) & 0xFF in (13, 27):
+                        LOGGER.info("Preview window closed by the user")
+                        break
+                elif window_open:
+                    cv2.destroyWindow('AirClick Preview')
+                    cv2.waitKey(1)
+                    window_open = False
+
+                elapsed = time.perf_counter() - frame_started
+                self._fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                budget = 1.0 / max(1, int(camera["fps_cap"]))
+                if elapsed < budget:
+                    time.sleep(budget - elapsed)
+                self._emit(gesture=gesture_name)
+
+        except pyautogui.FailSafeException:
+            LOGGER.warning("Corner failsafe triggered, stopping gesture control")
+            self._emit(message="Failsafe triggered, gesture control stopped")
+        except CameraError as exc:
+            LOGGER.error("%s", exc)
+            self._emit(message=str(exc))
+        except Exception as exc:  # a failure here must not take the app down
+            LOGGER.exception("Gesture control stopped unexpectedly")
+            self._emit(message="Gesture control stopped: {}".format(exc))
+        finally:
+            GestureController.gc_mode = 0
+            GestureController._stop_event.set()
+            Controller.reset()
+            self._stop_panic_hotkey()
+            if hands is not None:
+                hands.close()
+            if capture is not None:
+                capture.release()
+            GestureController.cap = None
+            if window_open:
+                cv2.destroyAllWindows()
+                cv2.waitKey(1)
+            LOGGER.info("Gesture control stopped")
+            self._emit(running=False, message="Gesture control stopped")
+
+
+def _gesture_label(gesture):
+    """Human readable name for a detected gesture."""
+    try:
+        return Gest(gesture).name
+    except ValueError:
+        return str(gesture)
+
+
+_engine_lock = threading.Lock()
+_engine_thread = None
+
+
+def is_running() -> bool:
+    """True while the gesture engine is processing frames."""
+    return bool(GestureController.gc_mode)
+
+
+def start_gesture_control(settings=None, status_callback=None) -> bool:
+    """Start the engine on a background thread. False if it was already on."""
+    global _engine_thread
+    with _engine_lock:
+        if _engine_thread is not None and _engine_thread.is_alive():
+            return False
+        controller = GestureController(settings=settings, status_callback=status_callback)
+        _engine_thread = threading.Thread(
+            target=controller.start, name="airclick-gestures", daemon=True
+        )
+        _engine_thread.start()
+        return True
+
+
+def stop_gesture_control(timeout: float = 5.0) -> bool:
+    """Stop the engine and wait for the camera to be released."""
+    global _engine_thread
+    with _engine_lock:
+        thread = _engine_thread
+    if thread is None or not thread.is_alive():
+        GestureController.gc_mode = 0
+        return False
+    GestureController.stop()
+    thread.join(timeout)
+    if thread.is_alive():
+        LOGGER.warning("Gesture engine did not stop within %.1fs", timeout)
+    return True
+
+
+if __name__ == "__main__":
+    from airclick_settings import configure_logging
+
+    configure_logging()
+    GestureController().start()
