@@ -5,6 +5,7 @@ import pytest
 from Gesture_Controller import (
     Controller,
     Gest,
+    GestureController,
     HandRecog,
     HLabel,
     _gesture_label,
@@ -189,3 +190,55 @@ def test_preview_frames_are_shrunk_and_jpeg_encoded():
 def test_the_preview_setting_offers_all_three_destinations(settings):
     for choice in ("in app window", "separate window", "off"):
         assert settings.set("camera", "preview", choice) == choice
+
+
+# ------------------------------------------------------------ hand routing
+
+
+class FakeResults:
+    def __init__(self, labels):
+        self.multi_handedness = [
+            {"classification": [{"label": label}]} for label in labels
+        ]
+        self.multi_hand_landmarks = ["hand-" + label for label in labels]
+
+
+@pytest.fixture
+def right_handed(monkeypatch):
+    # The fakes stand in for protobuf messages, so skip the real conversion.
+    monkeypatch.setattr(
+        "Gesture_Controller.MessageToDict", lambda message: message
+    )
+    previous = GestureController.dom_hand
+    GestureController.dom_hand = True
+    yield
+    GestureController.dom_hand = previous
+    GestureController.hr_major = None
+    GestureController.hr_minor = None
+
+
+def test_two_hands_are_split_by_the_dominant_hand_setting(right_handed):
+    GestureController.classify_hands(FakeResults(["Right", "Left"]))
+    assert GestureController.hr_major == "hand-Right"
+    assert GestureController.hr_minor == "hand-Left"
+
+
+def test_a_lone_non_dominant_hand_still_drives_the_cursor(right_handed):
+    """Otherwise a left-handed user gets no control at all: the major hand
+    stays None, every gesture reads as the default PALM and nothing happens."""
+    GestureController.classify_hands(FakeResults(["Left"]))
+    assert GestureController.hr_major == "hand-Left"
+    assert GestureController.hr_minor is None
+
+
+def test_a_lone_dominant_hand_is_unaffected(right_handed):
+    GestureController.classify_hands(FakeResults(["Right"]))
+    assert GestureController.hr_major == "hand-Right"
+    assert GestureController.hr_minor is None
+
+
+def test_handedness_is_swapped_when_the_image_is_not_mirrored(right_handed):
+    """Mediapipe labels hands assuming a selfie view."""
+    GestureController.classify_hands(FakeResults(["Right", "Left"]), mirrored=False)
+    assert GestureController.hr_major == "hand-Left"
+    assert GestureController.hr_minor == "hand-Right"

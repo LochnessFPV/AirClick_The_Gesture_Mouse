@@ -742,11 +742,15 @@ class GestureController:
 
     # ------------------------------------------------------------ processing
 
-    def classify_hands(results):
+    def classify_hands(results, mirrored=True):
         """
         sets 'hr_major', 'hr_minor' based on classification(left, right) of 
         hand obtained from mediapipe, uses 'dom_hand' to decide major and
         minor hand.
+
+        If only one hand is visible it always becomes the major hand, whichever
+        hand it is: requiring the dominant hand would otherwise leave users
+        with no control at all when they raise the other one.
         """
         left, right = None, None
         handedness = getattr(results, "multi_handedness", None) or []
@@ -758,17 +762,27 @@ class GestureController:
             except (KeyError, IndexError, TypeError):
                 LOGGER.debug("Unreadable handedness entry %s", index)
                 continue
+            # Mediapipe labels hands as if the image were a selfie view; with
+            # mirroring off the frame is not, so the labels are the wrong way round.
+            if not mirrored:
+                label = "Left" if label == "Right" else "Right"
             if label == "Right":
                 right = landmarks[index]
             else:
                 left = landmarks[index]
 
         if GestureController.dom_hand == True:
-            GestureController.hr_major = right
-            GestureController.hr_minor = left
+            major, minor = right, left
         else :
-            GestureController.hr_major = left
-            GestureController.hr_minor = right
+            major, minor = left, right
+
+        if major is None:
+            detected = [hand for hand in (right, left) if hand is not None]
+            if len(detected) == 1:
+                major, minor = detected[0], None
+
+        GestureController.hr_major = major
+        GestureController.hr_minor = minor
 
     def _apply_runtime_settings(self, config):
         GestureController.dom_hand = config["modes"]["dominant_hand"] == "right"
@@ -869,14 +883,16 @@ class GestureController:
                 results = hands.process(rgb)
 
                 gesture_name = "none"
+                hands_seen = 0
                 if results.multi_hand_landmarks:
+                    hands_seen = len(results.multi_hand_landmarks)
                     self._last_hand_seen = time.time()
                     if self._paused:
                         self._paused = False
                         LOGGER.info("Hand detected, resuming")
                         self._emit(message="Resumed")
 
-                    GestureController.classify_hands(results)
+                    GestureController.classify_hands(results, camera["mirror"])
                     handmajor.update_hand_result(GestureController.hr_major)
                     handminor.update_hand_result(GestureController.hr_minor)
 
@@ -932,7 +948,7 @@ class GestureController:
                     time.sleep(budget - elapsed)
                 cycle = time.perf_counter() - frame_started
                 self._fps = 1.0 / cycle if cycle > 0 else 0.0
-                self._emit(gesture=gesture_name)
+                self._emit(gesture=gesture_name, hands=hands_seen)
 
         except pyautogui.FailSafeException:
             LOGGER.warning("Corner failsafe triggered, stopping gesture control")

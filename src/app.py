@@ -29,6 +29,7 @@ _status = {
     "paused": False,
     "fps": 0.0,
     "gesture": "none",
+    "hands": 0,
     "message": "Idle",
 }
 

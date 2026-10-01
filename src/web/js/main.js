@@ -72,8 +72,11 @@ function updateStatus(status) {
 
     const parts = [];
     if (status.message) { parts.push(status.message); }
-    if (status.running && status.gesture && status.gesture !== "none") {
-        parts.push("Gesture: " + status.gesture);
+    if (status.running) {
+        parts.push((status.hands || 0) + " hand" + (status.hands === 1 ? "" : "s"));
+        if (status.gesture && status.gesture !== "none") {
+            parts.push("Gesture: " + status.gesture);
+        }
     }
     line.textContent = parts.join(" \u2014 ") || "Gesture control is off.";
 
