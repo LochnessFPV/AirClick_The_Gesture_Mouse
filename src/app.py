@@ -113,6 +113,7 @@ def is_gesture_running():
 class ChatBot:
 
     started = False
+    ready = threading.Event()
     userinputQueue = Queue()
 
     def isUserInput():
@@ -126,6 +127,7 @@ class ChatBot:
             return
         LOGGER.info("UI window closed, shutting down")
         ChatBot.started = False
+        ChatBot.ready.set()
         stop_gesture()
 
     @eel.expose
@@ -135,6 +137,7 @@ class ChatBot:
 
     def close():
         ChatBot.started = False
+        ChatBot.ready.set()
 
     def addUserMsg(msg):
         try:
@@ -169,12 +172,14 @@ class ChatBot:
                 eel.start("index.html", mode="default", **options)
 
             ChatBot.started = True
+            ChatBot.ready.set()
             while ChatBot.started:
                 eel.sleep(1.0)
         except Exception:
             LOGGER.exception("The UI could not be started")
         finally:
             ChatBot.started = False
+            ChatBot.ready.set()
 
 
 # ------------------------------------------------------------- UI endpoints
