@@ -1,6 +1,15 @@
+import base64
+
 import pytest
 
-from Gesture_Controller import Controller, Gest, HandRecog, HLabel, _gesture_label
+from Gesture_Controller import (
+    Controller,
+    Gest,
+    HandRecog,
+    HLabel,
+    _gesture_label,
+    encode_preview,
+)
 
 
 class FakeLandmark:
@@ -155,3 +164,28 @@ def test_scroll_step_follows_the_setting(configured, fake_mouse):
     Controller.pinchlv = 1.0
     Controller.scrollVertical()
     assert ("scroll", (240,), {}) in fake_mouse.calls
+
+
+# ----------------------------------------------------------------- preview
+
+
+def test_preview_frames_are_shrunk_and_jpeg_encoded():
+    numpy = pytest.importorskip("numpy")
+    cv2 = pytest.importorskip("cv2")
+    if not hasattr(cv2, "imencode"):
+        pytest.skip("cv2 is stubbed in this environment")
+
+    frame = numpy.zeros((480, 640, 3), dtype=numpy.uint8)
+    encoded = encode_preview(frame)
+
+    assert isinstance(encoded, str) and encoded
+    decoded = cv2.imdecode(
+        numpy.frombuffer(base64.b64decode(encoded), dtype=numpy.uint8), cv2.IMREAD_COLOR
+    )
+    assert decoded.shape[1] == 320  # downscaled for the websocket
+    assert len(encoded) < 40_000
+
+
+def test_the_preview_setting_offers_all_three_destinations(settings):
+    for choice in ("in app window", "separate window", "off"):
+        assert settings.set("camera", "preview", choice) == choice

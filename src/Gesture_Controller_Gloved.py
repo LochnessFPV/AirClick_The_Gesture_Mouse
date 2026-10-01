@@ -19,7 +19,7 @@ import cv2
 import cv2.aruco as aruco
 import pyautogui
 
-from Gesture_Controller import CameraError, open_camera
+from Gesture_Controller import CameraError, encode_preview, open_camera
 from airclick_settings import get_settings
 
 LOGGER = logging.getLogger("airclick.glove")
@@ -588,9 +588,11 @@ class GestureController:
     _stop_event = threading.Event()
     _build_lock = threading.Lock()
 
-    def __init__(self, settings=None, status_callback=None):
+    def __init__(self, settings=None, status_callback=None, frame_callback=None):
         self.settings = settings or get_settings()
         self.status_callback = status_callback
+        self.frame_callback = frame_callback
+        self._last_preview_sent = 0.0
         self._fps = 0.0
 
     @classmethod
@@ -626,6 +628,21 @@ class GestureController:
             self.status_callback(payload)
         except Exception:
             LOGGER.exception("Status callback failed")
+
+    def _send_preview(self, image):
+        if self.frame_callback is None:
+            return
+        now = time.monotonic()
+        if now - self._last_preview_sent < 1.0 / 12.0:
+            return
+        self._last_preview_sent = now
+        encoded = encode_preview(image)
+        if encoded is None:
+            return
+        try:
+            self.frame_callback(encoded)
+        except Exception:
+            LOGGER.debug("Could not deliver a preview frame", exc_info=True)
 
     def start(self):
         GestureController._stop_event.clear()
@@ -710,13 +727,17 @@ class GestureController:
                                      exc_info=True)
                         FinalMask = None
 
-                if camera["show_preview"]:
-                    if GestureController.aru_marker.is_detected():
-                        GestureController.aru_marker.draw_marker(frame)
-                        draw_box(frame, GestureController.hand_roi.roi_corners, (255,0,0))
-                        draw_box(frame, GestureController.hand_roi.hsv_corners, (0,0,250))
-                        if FinalMask is not None:
-                            cv2.imshow('AirClick Glove Mask', FinalMask)
+                preview = camera["preview"]
+                if preview != "off" and GestureController.aru_marker.is_detected():
+                    GestureController.aru_marker.draw_marker(frame)
+                    draw_box(frame, GestureController.hand_roi.roi_corners, (255,0,0))
+                    draw_box(frame, GestureController.hand_roi.hsv_corners, (0,0,250))
+
+                if preview == "in app window":
+                    self._send_preview(frame)
+                elif preview == "separate window":
+                    if FinalMask is not None:
+                        cv2.imshow('AirClick Glove Mask', FinalMask)
                     cv2.imshow('AirClick Preview', frame)
                     if cv2.waitKey(1) & 0xFF in (13, 27, ord('q')):
                         LOGGER.info("Preview window closed by the user")

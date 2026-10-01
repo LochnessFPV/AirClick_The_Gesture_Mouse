@@ -95,6 +95,18 @@ document.getElementById("stopButton").addEventListener("click", async () => {
 eel.expose(addUserMsg);
 eel.expose(addAppMsg);
 eel.expose(updateStatus);
+eel.expose(updatePreview);
+
+let previewTimer = null;
+
+/** Draw one camera frame, and hide the panel when frames stop arriving. */
+function updatePreview(jpegBase64) {
+    const panel = document.getElementById("previewPanel");
+    document.getElementById("previewImage").src = "data:image/jpeg;base64," + jpegBase64;
+    panel.hidden = false;
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => { panel.hidden = true; }, 1500);
+}
 
 // ---------------------------------------------------------------- settings
 

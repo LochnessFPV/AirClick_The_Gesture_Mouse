@@ -80,6 +80,14 @@ def _publish_status(update):
         LOGGER.debug("Could not push status to the UI", exc_info=True)
 
 
+def _publish_frame(jpeg_base64):
+    """Send one camera frame to the app window."""
+    try:
+        eel.updatePreview(jpeg_base64)
+    except Exception:
+        LOGGER.debug("Could not push a preview frame to the UI", exc_info=True)
+
+
 def start_gesture():
     """Start whichever engine the Glove mode setting selects."""
     global _glove_thread
@@ -98,7 +106,9 @@ def start_gesture():
                     "Glove mode off in Settings."
                 )
             controller = module.GestureController(
-                settings=_settings, status_callback=_publish_status
+                settings=_settings,
+                status_callback=_publish_status,
+                frame_callback=_publish_frame,
             )
             _glove_thread = threading.Thread(
                 target=controller.start, name="airclick-glove", daemon=True
@@ -107,7 +117,9 @@ def start_gesture():
             return True, "Glove gesture control started"
 
         started = Gesture_Controller.start_gesture_control(
-            settings=_settings, status_callback=_publish_status
+            settings=_settings,
+            status_callback=_publish_status,
+            frame_callback=_publish_frame,
         )
         if not started:
             return False, "Gesture control is already running"

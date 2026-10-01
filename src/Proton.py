@@ -25,8 +25,7 @@ LOGGER = logging.getLogger("airclick.assistant")
 
 # -------------Object Initialization---------------
 recognizer = sr.Recognizer()
-recognizer.energy_threshold = 500
-recognizer.dynamic_energy_threshold = False
+recognizer.dynamic_energy_threshold = True
 recognizer.pause_threshold = 0.8
 
 keyboard = Controller()
@@ -34,6 +33,10 @@ settings = get_settings()
 
 WAKE_WORD = "proton"
 BROWSE_ROOT = Path.home()
+
+#: Seconds to wait for speech to start before handing control back to the main
+#: loop. Without this the assistant would ignore typed commands indefinitely.
+LISTEN_TIMEOUT = 3.0
 
 # ----------------Variables------------------------
 is_awake = True  # Bot status
@@ -84,15 +87,36 @@ def wish():
 
 
 # Audio to String
-def record_audio():
-    """Listen once and return the recognised text in lower case."""
+def calibrate_microphone():
+    """Measure room noise once so the trigger level suits this machine."""
     try:
         with sr.Microphone() as source:
-            audio = recognizer.listen(source, phrase_time_limit=5)
+            recognizer.adjust_for_ambient_noise(source, duration=1.0)
+        LOGGER.info("Microphone calibrated, energy threshold %.0f",
+                    recognizer.energy_threshold)
+        return True
     except OSError:
-        LOGGER.warning("No microphone is available; voice input is off")
+        LOGGER.warning("No microphone is available; voice input is off", exc_info=True)
+        return False
+
+
+def record_audio():
+    """Listen briefly and return the recognised text in lower case.
+
+    Returns an empty string when nothing was heard within LISTEN_TIMEOUT, so
+    the caller can go back to checking for typed input.
+    """
+    try:
+        with sr.Microphone() as source:
+            audio = recognizer.listen(
+                source, timeout=LISTEN_TIMEOUT, phrase_time_limit=5
+            )
+    except sr.WaitTimeoutError:
+        return ""
+    except OSError:
+        LOGGER.warning("The microphone became unavailable; voice input is off")
         settings.set("modes", "voice_assistant", False)
-        reply("I cannot find a microphone, so I have switched voice input off.")
+        reply("I lost the microphone, so I have switched voice input off.")
         return ""
 
     try:
@@ -331,6 +355,9 @@ def main():
     if not app.ChatBot.ready.wait(timeout=30):
         LOGGER.error("The UI did not start in time")
         return 1
+
+    if settings.get("modes", "voice_assistant") and not calibrate_microphone():
+        settings.set("modes", "voice_assistant", False)
 
     wish()
 

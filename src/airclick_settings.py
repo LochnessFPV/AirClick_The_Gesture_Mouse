@@ -143,7 +143,11 @@ SCHEMA: Dict[str, Dict[str, Setting]] = {
             "Lower values use less battery.",
             minimum=5, maximum=60, step=1,
         ),
-        "show_preview": Setting(True, "bool", "Show camera preview"),
+        "preview": Setting(
+            "in app window", "choice", "Camera preview",
+            "Where to show what the camera sees.",
+            choices=("in app window", "separate window", "off"),
+        ),
         "mirror": Setting(True, "bool", "Mirror the camera image"),
     },
     "modes": {

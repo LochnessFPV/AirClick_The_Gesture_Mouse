@@ -252,7 +252,7 @@ Every setting - pointer speed, smoothing, click behaviour, camera, safety - can 
   | Pointer | Speed, smoothness, dead zone, glide time |
   | Clicks | Pinch sensitivity and hold time, gesture stability, and a switch for each click type |
   | Scroll & Media | Scroll speed, volume step, brightness step, and a switch for each |
-  | Camera | Device, resolution, frame-rate limit, preview window, mirroring |
+  | Camera | Device, resolution, frame-rate limit, preview (in the app window, a separate window, or off), mirroring |
   | Modes | Glove mode, dominant hand, detection and tracking confidence, voice assistant |
   | Safety | Corner failsafe, panic hotkey, auto-pause when no hand is seen |
   | General | Log detail, confirmation before opening files |

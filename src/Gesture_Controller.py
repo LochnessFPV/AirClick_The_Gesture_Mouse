@@ -8,6 +8,7 @@ Everything that used to be a hard-coded constant now comes from
 retune the engine while it is running.
 """
 
+import base64
 import logging
 import math
 import threading
@@ -44,7 +45,26 @@ mp_hands = mp.solutions.hands
 _ACCEL_GAIN = 0.07
 _ACCEL_CEILING = 2.1
 
+# In-app preview: small and infrequent enough to stay cheap over the websocket.
+_PREVIEW_WIDTH = 320
+_PREVIEW_FPS = 12
+_PREVIEW_QUALITY = 60
+
 StatusCallback = Callable[[Dict[str, object]], None]
+
+
+def encode_preview(image):
+    """Return a small base64 JPEG of 'image' for display in the app window."""
+    height, width = image.shape[:2]
+    if width > _PREVIEW_WIDTH:
+        scale = _PREVIEW_WIDTH / float(width)
+        image = cv2.resize(image, (_PREVIEW_WIDTH, int(height * scale)))
+    ok, buffer = cv2.imencode(
+        ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), _PREVIEW_QUALITY]
+    )
+    if not ok:
+        return None
+    return base64.b64encode(buffer).decode("ascii")
 
 
 class CameraError(RuntimeError):
@@ -635,13 +655,15 @@ class GestureController:
 
     _stop_event = threading.Event()
 
-    def __init__(self, settings=None, status_callback=None):
+    def __init__(self, settings=None, status_callback=None, frame_callback=None):
         """Initializes attributes."""
         self.settings = settings or get_settings()
         self.status_callback = status_callback
+        self.frame_callback = frame_callback
         self._hotkey_listener = None
         self._paused = False
         self._last_hand_seen = time.time()
+        self._last_preview_sent = 0.0
         self._fps = 0.0
 
     # ------------------------------------------------------------- lifecycle
@@ -669,6 +691,22 @@ class GestureController:
             self.status_callback(payload)
         except Exception:
             LOGGER.exception("Status callback failed")
+
+    def _send_preview(self, image):
+        """Push a frame to the app window, rate limited independently of the loop."""
+        if self.frame_callback is None:
+            return
+        now = time.monotonic()
+        if now - self._last_preview_sent < 1.0 / _PREVIEW_FPS:
+            return
+        self._last_preview_sent = now
+        encoded = encode_preview(image)
+        if encoded is None:
+            return
+        try:
+            self.frame_callback(encoded)
+        except Exception:
+            LOGGER.debug("Could not deliver a preview frame", exc_info=True)
 
     def _start_panic_hotkey(self):
         combo = str(self.settings.get("safety", "panic_hotkey"))
@@ -855,7 +893,7 @@ class GestureController:
                     gesture_name = _gesture_label(gest_name)
                     Controller.handle_controls(gest_name, hand_result)
 
-                    if camera["show_preview"]:
+                    if camera["preview"] != "off":
                         for hand_landmarks in results.multi_hand_landmarks:
                             mp_drawing.draw_landmarks(
                                 image, hand_landmarks, mp_hands.HAND_CONNECTIONS
@@ -874,7 +912,10 @@ class GestureController:
                         LOGGER.info("No hand seen for %.1fs, pausing", auto_pause)
                         self._emit(message="Paused, no hand detected")
 
-                if camera["show_preview"]:
+                preview = camera["preview"]
+                if preview == "in app window":
+                    self._send_preview(image)
+                if preview == "separate window":
                     cv2.imshow('AirClick Preview', image)
                     window_open = True
                     if cv2.waitKey(1) & 0xFF in (13, 27):
@@ -936,13 +977,17 @@ def is_running() -> bool:
     return bool(GestureController.gc_mode)
 
 
-def start_gesture_control(settings=None, status_callback=None) -> bool:
+def start_gesture_control(settings=None, status_callback=None, frame_callback=None) -> bool:
     """Start the engine on a background thread. False if it was already on."""
     global _engine_thread
     with _engine_lock:
         if _engine_thread is not None and _engine_thread.is_alive():
             return False
-        controller = GestureController(settings=settings, status_callback=status_callback)
+        controller = GestureController(
+            settings=settings,
+            status_callback=status_callback,
+            frame_callback=frame_callback,
+        )
         _engine_thread = threading.Thread(
             target=controller.start, name="airclick-gestures", daemon=True
         )
